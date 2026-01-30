@@ -55,22 +55,27 @@ npx playwright install chromium
 
 ### Step 1: Authentication (One-Time Setup)
 
-Authenticate with Ashby using your browser:
+The recommended way to authenticate is to use your existing Ashby session from Google Chrome:
+
+1. Log in to Ashby normally in Google Chrome at `app.ashbyhq.com`
+2. Open Chrome DevTools (F12 or Cmd+Option+I)
+3. Go to **Application** → **Cookies** → `https://app.ashbyhq.com`
+4. Find the session cookie (typically named `__session` or similar) and copy its value
+5. Run the auth command with your cookie:
+
+```bash
+npm run start -- auth-cookie --cookie "your_cookie_value_here"
+```
+
+This saves the session to `.ashby-session.json` for subsequent extractions.
+
+**Alternative**: Browser-based authentication (may have issues with SSO):
 
 ```bash
 npm run start -- auth
 ```
 
-- A Chromium window will open at `app.ashbyhq.com/signin`
-- Complete your normal SSO/MFA login
-- The session will be saved to `.ashby-session.json`
-- Close the browser when done
-
-**Alternative**: Use existing browser cookies:
-
-```bash
-npm run start -- auth-cookie --cookie "your_cookie_string"
-```
+This opens a Chromium window for login, but using your existing Chrome session is more reliable.
 
 ### Step 2: Extract Pipeline Data
 
@@ -139,10 +144,10 @@ npm run start -- recon
 
 ### Re-authentication
 
-If your session expires, simply run:
+If your session expires, grab a fresh cookie from Chrome and run:
 
 ```bash
-npm run start -- auth
+npm run start -- auth-cookie --cookie "your_new_cookie"
 ```
 
 ## Project Structure
@@ -213,10 +218,10 @@ Structured data with normalized companies, jobs, and candidates:
 
 **Error**: `Failed to fetch CSRF token` or `401 Unauthorized`
 
-**Solution**: Re-authenticate:
-```bash
-npm run start -- auth
-```
+**Solution**: Re-authenticate by grabbing a fresh session cookie from Chrome:
+1. Log in to Ashby in Chrome
+2. Copy the session cookie from DevTools
+3. Run: `npm run start -- auth-cookie --cookie "your_new_cookie"`
 
 ### No Organizations Found
 
