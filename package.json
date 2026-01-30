@@ -1,0 +1,32 @@
+{
+  "name": "ashby-automation",
+  "version": "0.1.0",
+  "description": "Read-only Ashby candidate pipeline aggregator using Playwright and internal API replay.",
+  "main": "dist/cli.js",
+  "bin": {
+    "ashby-automation": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node --loader ts-node/esm src/cli.ts"
+  },
+  "keywords": [
+    "ashby",
+    "recruiting",
+    "automation",
+    "playwright"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^25.0.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "cross-fetch": "^4.1.0",
+    "playwright": "^1.57.0"
+  }
+}
