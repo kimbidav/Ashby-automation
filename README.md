@@ -108,10 +108,10 @@ npm run start -- extract --retries 3
 
 ### Step 3: Review the Data
 
-The CSV output follows this schema:
+The CSV output includes pipeline progress, feedback scores, and interview history:
 
 ```csv
-company_name,job_title,job_id,candidate_name,candidate_id,stage_name,stage_type,last_activity_at,days_in_stage,needs_scheduling
+company_name,job_title,job_id,candidate_name,candidate_id,pipeline_stage,decision_status,stage_type,current_stage_index,total_stages,stage_progress,last_activity_at,days_in_stage,needs_scheduling,credited_to,source,feedback_count,latest_recommendation,latest_feedback_author,latest_feedback_date,current_stage_interviews,current_stage_avg_score,current_stage_date,interview_history_summary
 ```
 
 **Field Descriptions:**
@@ -121,11 +121,25 @@ company_name,job_title,job_id,candidate_name,candidate_id,stage_name,stage_type,
 - `job_id`: Unique job identifier
 - `candidate_name`: Candidate name
 - `candidate_id`: Unique candidate identifier
-- `stage_name`: Current pipeline stage
+- `pipeline_stage`: Current pipeline stage (e.g., "Technical Interviews", "Onsite")
+- `decision_status`: Action needed (e.g., "Needs Decision", "Scheduled", "Waiting on Availability")
 - `stage_type`: Type of stage (e.g., "interview", "technical_screen")
+- `current_stage_index`: Which stage number the candidate is on (1-based)
+- `total_stages`: Total number of stages in the pipeline
+- `stage_progress`: Combined progress string (e.g., "3/5" or "Technical Interview (3/5)")
 - `last_activity_at`: ISO timestamp of last activity
 - `days_in_stage`: Number of days since last activity
 - `needs_scheduling`: `true` if candidate is in an interview stage and inactive >= 7 days
+- `credited_to`: Recruiter or person credited for the candidate
+- `source`: How the candidate was sourced
+- `feedback_count`: Total number of feedback submissions received
+- `latest_recommendation`: Most recent interviewer score (e.g., "2", "3", "4")
+- `latest_feedback_author`: Who gave the most recent feedback
+- `latest_feedback_date`: When the latest feedback was submitted
+- `current_stage_interviews`: Detailed breakdown of recent interviews with scores and feedback
+- `current_stage_avg_score`: Average score across current stage interviews
+- `current_stage_date`: Date of current stage interviews
+- `interview_history_summary`: Summary of previous interview stages with dates and scores
 
 ## Advanced Usage
 
@@ -175,16 +189,16 @@ Ashby Automation/
 
 ### CSV Format
 
-Flat, human-readable table with one row per candidate:
+Flat, human-readable table with one row per candidate, including pipeline progress and feedback:
 
 ```csv
-company_name,job_title,job_id,candidate_name,candidate_id,stage_name,stage_type,last_activity_at,days_in_stage,needs_scheduling
-Canals,Senior Software Engineer,job_123,John Doe,cand_456,First Call,interview,2026-01-15T10:30:00Z,7,true
+company_name,job_title,job_id,candidate_name,candidate_id,pipeline_stage,decision_status,stage_type,current_stage_index,total_stages,stage_progress,last_activity_at,days_in_stage,needs_scheduling,credited_to,source,feedback_count,latest_recommendation,latest_feedback_author,latest_feedback_date,current_stage_interviews,current_stage_avg_score,current_stage_date,interview_history_summary
+Canals,Senior Software Engineer,job_123,John Doe,cand_456,Technical Interviews,Needs Decision,interview,3,5,3/5,2026-01-15T10:30:00Z,7,true,Jane Smith,LinkedIn,3,4,Bob Jones,2026-01-14,"• Technical Interview - Bob Jones - Score: 4",4.0,2026-01-14,2026-01-10: Phone Screen (3.5)
 ```
 
 ### JSON Format
 
-Structured data with normalized companies, jobs, and candidates:
+Structured data with normalized companies, jobs, and candidates including interview feedback:
 
 ```json
 {
@@ -198,15 +212,27 @@ Structured data with normalized companies, jobs, and candidates:
     {
       "id": "cand_456",
       "name": "John Doe",
-      "currentStage": "First Call",
+      "pipelineStage": "Technical Interviews",
+      "decisionStatus": "Needs Decision",
       "stageType": "interview",
+      "currentStageIndex": 3,
+      "totalStages": 5,
+      "stageProgress": "3/5",
       "jobId": "job_123",
       "companyId": "org_123-company",
       "orgId": "org_123",
       "orgName": "Canals",
       "lastActivityAt": "2026-01-15T10:30:00Z",
       "daysInStage": 7,
-      "needsScheduling": true
+      "needsScheduling": true,
+      "creditedTo": "Jane Smith",
+      "source": "LinkedIn",
+      "feedbackCount": 3,
+      "latestOverallRecommendation": "4",
+      "latestFeedbackAuthor": "Bob Jones",
+      "latestFeedbackDate": "2026-01-14",
+      "interviewEvents": [...],
+      "allFeedback": [...]
     }
   ]
 }
