@@ -6,3 +6,15 @@ ashby-recon-log.json
 .env
 *.log
 .DS_Store
+
+# Output and test files
+output/
+output.csv
+output.json
+test.csv
+test.json
+test-output.csv
+test-output.json
+
+# GraphQL query files (auto-generated/internal)
+query_*.graphql
