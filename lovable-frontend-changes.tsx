@@ -247,29 +247,19 @@ export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    // Check if returning from OAuth redirect with tokens
-    const params = new URLSearchParams(window.location.search);
-    const tokenParam = params.get("google_tokens");
-    if (tokenParam) {
-      try {
-        const tokens = JSON.parse(decodeURIComponent(tokenParam));
-        storeTokens(tokens);
+    // Check localStorage for existing tokens
+    setHasTokens(!!getStoredTokens());
+
+    // Listen for tokens from the OAuth popup
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === "google_tokens" && event.data.tokens) {
+        storeTokens(event.data.tokens);
         setHasTokens(true);
         toast.success("Google Calendar connected!");
-      } catch {
-        toast.error("Failed to save Google tokens.");
       }
-      // Clean up URL
-      params.delete("google_tokens");
-      const newUrl = params.toString()
-        ? `${window.location.pathname}?${params}`
-        : window.location.pathname;
-      window.history.replaceState({}, "", newUrl);
-      return;
-    }
-
-    // Check localStorage
-    setHasTokens(!!getStoredTokens());
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
   }, []);
 
   const handleConnect = async () => {
@@ -277,7 +267,11 @@ export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
       const res = await fetch(`${API_URL}/api/google/auth`);
       const data = await res.json();
       if (data.url) {
-        window.location.href = data.url;
+        // Open Google login in a popup window
+        const w = 500, h = 600;
+        const left = window.screenX + (window.outerWidth - w) / 2;
+        const top = window.screenY + (window.outerHeight - h) / 2;
+        window.open(data.url, "google-auth", `width=${w},height=${h},left=${left},top=${top}`);
       }
     } catch {
       toast.error("Could not reach the server to start Google auth.");

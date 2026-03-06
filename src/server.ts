@@ -87,17 +87,20 @@ app.get('/api/google/callback', async (req, res) => {
   }
   try {
     const tokens = await exchangeCode(code);
-    // Redirect to frontend with tokens encoded in the hash (not query params, for security)
-    const frontendUrl = process.env.FRONTEND_URL || '';
-    const tokenParam = encodeURIComponent(JSON.stringify(tokens));
-    if (frontendUrl) {
-      res.redirect(`${frontendUrl}?google_tokens=${tokenParam}`);
-    } else {
-      res.json({ success: true, tokens });
-    }
+    // Send tokens to the opener window via postMessage and close the popup
+    const tokensJson = JSON.stringify(tokens);
+    res.send(`<!DOCTYPE html><html><body><script>
+      if (window.opener) {
+        window.opener.postMessage({ type: 'google_tokens', tokens: ${tokensJson} }, '*');
+      }
+      window.close();
+    </script><p>Google Calendar connected. You can close this window.</p></body></html>`);
   } catch (err: any) {
     console.error('Google OAuth error:', err?.message);
-    res.status(500).json({ error: 'Failed to complete Google OAuth.', detail: err?.message });
+    res.send(`<!DOCTYPE html><html><body>
+      <p>Failed to connect Google Calendar: ${err?.message || 'Unknown error'}</p>
+      <p>Please close this window and try again.</p>
+    </body></html>`);
   }
 });
 
