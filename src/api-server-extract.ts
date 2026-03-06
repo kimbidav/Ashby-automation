@@ -44,19 +44,24 @@ export interface ExtractResult {
 export function createSessionFromCookie(cookieHeader: string): AshbySession {
   const cookieMap: Record<string, string> = {};
 
-  cookieHeader
-    .split(';')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .forEach((pair) => {
-      const eqIndex = pair.indexOf('=');
-      if (eqIndex === -1) return;
-      const name = pair.slice(0, eqIndex).trim();
-      const value = pair.slice(eqIndex + 1).trim();
-      if (name && value) {
-        cookieMap[name] = value;
-      }
-    });
+  // If the user pasted just the raw token value (no "=" sign), treat it as the session token
+  if (!cookieHeader.includes('=')) {
+    cookieMap['ashby_session_token'] = cookieHeader;
+  } else {
+    cookieHeader
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .forEach((pair) => {
+        const eqIndex = pair.indexOf('=');
+        if (eqIndex === -1) return;
+        const name = pair.slice(0, eqIndex).trim();
+        const value = pair.slice(eqIndex + 1).trim();
+        if (name && value) {
+          cookieMap[name] = value;
+        }
+      });
+  }
 
   return {
     cookies: cookieMap,
