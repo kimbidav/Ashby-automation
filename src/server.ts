@@ -11,6 +11,7 @@
 import express from 'express';
 import cors from 'cors';
 import { createSessionFromCookie, extractPipeline } from './api-server-extract.js';
+import { getAuthUrl, exchangeCode, isAuthenticated, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -67,6 +68,59 @@ app.post('/api/extract', async (req, res) => {
 
     console.error('Extraction error:', message);
     res.status(500).json({ error: 'Extraction failed.', detail: message });
+  }
+});
+
+// --- Google Calendar OAuth ---
+
+app.get('/api/google/auth', (_req, res) => {
+  res.json({ url: getAuthUrl() });
+});
+
+app.get('/api/google/callback', async (req, res) => {
+  const code = req.query.code as string;
+  if (!code) {
+    res.status(400).json({ error: 'Missing code parameter.' });
+    return;
+  }
+  try {
+    await exchangeCode(code);
+    const frontendUrl = process.env.FRONTEND_URL || '';
+    if (frontendUrl) {
+      res.redirect(`${frontendUrl}?google_auth=success`);
+    } else {
+      res.json({ success: true, message: 'Google Calendar connected.' });
+    }
+  } catch (err: any) {
+    console.error('Google OAuth error:', err?.message);
+    res.status(500).json({ error: 'Failed to complete Google OAuth.', detail: err?.message });
+  }
+});
+
+app.get('/api/google/status', (_req, res) => {
+  res.json({ authenticated: isAuthenticated() });
+});
+
+// --- Calendar batch add ---
+
+app.post('/api/calendar/add', async (req, res) => {
+  if (!isAuthenticated()) {
+    res.status(401).json({ error: 'Google Calendar not connected. Please authenticate first.' });
+    return;
+  }
+
+  const { events } = req.body as { events?: CalendarEventRequest[] };
+  if (!events || !Array.isArray(events) || events.length === 0) {
+    res.status(400).json({ error: 'Missing or empty "events" array in request body.' });
+    return;
+  }
+
+  try {
+    const result = await addEventsToCalendar(events);
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    console.error('Calendar add error:', err?.message);
+    res.status(500).json({ error: 'Failed to add calendar events.', detail: err?.message });
   }
 });
 

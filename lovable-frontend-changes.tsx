@@ -178,3 +178,168 @@ export function AshbyExtract({ onExtract }: AshbyExtractProps) {
 //
 //   <AshbyExtract onExtract={handleCsvUpload} />    {/* <-- ADD THIS */}
 //   <CsvUpload onUpload={handleCsvUpload} />
+
+// ============================================================
+// FILE 3: src/components/GoogleCalendarSync.tsx (NEW)
+// ============================================================
+//
+// This component adds a "Sync to Calendar" button that batch-adds
+// upcoming interviews for all currently-filtered candidates to
+// Google Calendar. It handles Google OAuth if not yet connected.
+//
+// IMPORTANT: The Candidate type must be updated to include interview_events:
+//
+//   interface InterviewEvent {
+//     id: string;
+//     interview_title: string;
+//     start_time: string;
+//     end_time: string;
+//   }
+//
+//   // Add to Candidate interface:
+//   interview_events?: InterviewEvent[];
+//
+// Props:
+//   candidates: Candidate[]  — the *filtered* candidates currently visible in the table
+//
+// Usage in Index.tsx:
+//   import { GoogleCalendarSync } from "@/components/GoogleCalendarSync";
+//
+//   // In the header actions area, add next to AshbyFetchButton:
+//   <GoogleCalendarSync candidates={filteredCandidates} />
+//
+// Component implementation for Lovable:
+
+import { useState, useEffect, useCallback } from "react";
+import { Calendar, Loader2, Check } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
+import { Candidate } from "@/data/candidates";
+
+const API_URL = "https://ashby-automation-production.up.railway.app";
+
+interface GoogleCalendarSyncProps {
+  candidates: Candidate[];
+}
+
+export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
+  const [googleAuth, setGoogleAuth] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
+  const checkAuth = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/google/status`);
+      const data = await res.json();
+      setGoogleAuth(data.authenticated);
+    } catch {
+      // Server unreachable — leave as not authenticated
+    } finally {
+      setCheckingAuth(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkAuth();
+    // Check if returning from OAuth redirect
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("google_auth") === "success") {
+      setGoogleAuth(true);
+      toast.success("Google Calendar connected!");
+      // Clean up URL
+      params.delete("google_auth");
+      const newUrl = params.toString()
+        ? `${window.location.pathname}?${params}`
+        : window.location.pathname;
+      window.history.replaceState({}, "", newUrl);
+    }
+  }, [checkAuth]);
+
+  const handleConnect = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/google/auth`);
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    } catch {
+      toast.error("Could not reach the server to start Google auth.");
+    }
+  };
+
+  const handleSync = async () => {
+    const now = new Date();
+    const events = candidates.flatMap((c) =>
+      (c.interview_events || [])
+        .filter((ev) => new Date(ev.start_time) > now)
+        .map((ev) => ({
+          candidate_name: c.candidate_name,
+          company_name: c.company_name,
+          interview_title: ev.interview_title,
+          start_time: ev.start_time,
+          end_time: ev.end_time,
+        }))
+    );
+
+    if (events.length === 0) {
+      toast.info("No upcoming interviews found for the filtered candidates.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/calendar/add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        toast.error(data.error || "Failed to add calendar events.");
+        return;
+      }
+
+      const parts: string[] = [];
+      if (data.created > 0) parts.push(`${data.created} added`);
+      if (data.skipped_duplicate > 0) parts.push(`${data.skipped_duplicate} already on calendar`);
+      if (data.skipped_past > 0) parts.push(`${data.skipped_past} past events skipped`);
+      if (data.errors > 0) parts.push(`${data.errors} errors`);
+
+      toast.success(`Calendar sync: ${parts.join(", ")}`);
+    } catch {
+      toast.error("Could not connect to the server.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (checkingAuth) return null;
+
+  if (!googleAuth) {
+    return (
+      <Button variant="outline" size="sm" className="gap-2" onClick={handleConnect}>
+        <Calendar className="h-4 w-4" />
+        Connect Google Calendar
+      </Button>
+    );
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="gap-2"
+      onClick={handleSync}
+      disabled={loading || candidates.length === 0}
+    >
+      {loading ? (
+        <Loader2 className="h-4 w-4 animate-spin" />
+      ) : (
+        <Calendar className="h-4 w-4" />
+      )}
+      {loading ? "Syncing..." : "Sync to Calendar"}
+    </Button>
+  );
+}

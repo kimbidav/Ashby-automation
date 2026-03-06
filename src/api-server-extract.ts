@@ -9,6 +9,13 @@
 import { AshbySession, Candidate, Company, Job } from './types.js';
 import { fetchAllAvailableOrgs, fetchPipelineForOrg, enrichCandidatesWithDetails } from './client.js';
 
+export interface ExtractedInterviewEvent {
+  id: string;
+  interview_title: string;
+  start_time: string;
+  end_time: string;
+}
+
 export interface ExtractedCandidate {
   company_name: string;
   job_title: string;
@@ -30,6 +37,7 @@ export interface ExtractedCandidate {
   latest_recommendation: string;
   latest_feedback_author: string;
   latest_feedback_date: string;
+  interview_events: ExtractedInterviewEvent[];
 }
 
 export interface ExtractResult {
@@ -155,6 +163,12 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
       latest_recommendation: cand.latestOverallRecommendation ?? '',
       latest_feedback_author: cand.latestFeedbackAuthor ?? '',
       latest_feedback_date: cand.latestFeedbackDate ?? '',
+      interview_events: (cand.interviewEvents || []).map((ev) => ({
+        id: ev.id,
+        interview_title: ev.interviewTitle,
+        start_time: ev.startTime,
+        end_time: ev.endTime,
+      })),
     };
   });
 
