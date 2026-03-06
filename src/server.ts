@@ -11,7 +11,7 @@
 import express from 'express';
 import cors from 'cors';
 import { createSessionFromCookie, extractPipeline } from './api-server-extract.js';
-import { getAuthUrl, exchangeCode, isAuthenticated, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
+import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -71,7 +71,9 @@ app.post('/api/extract', async (req, res) => {
   }
 });
 
-// --- Google Calendar OAuth ---
+// --- Google Calendar OAuth (multi-user) ---
+// Tokens are returned to the frontend and stored in localStorage.
+// The frontend sends tokens with each calendar request.
 
 app.get('/api/google/auth', (_req, res) => {
   res.json({ url: getAuthUrl() });
@@ -84,12 +86,14 @@ app.get('/api/google/callback', async (req, res) => {
     return;
   }
   try {
-    await exchangeCode(code);
+    const tokens = await exchangeCode(code);
+    // Redirect to frontend with tokens encoded in the hash (not query params, for security)
     const frontendUrl = process.env.FRONTEND_URL || '';
+    const tokenParam = encodeURIComponent(JSON.stringify(tokens));
     if (frontendUrl) {
-      res.redirect(`${frontendUrl}?google_auth=success`);
+      res.redirect(`${frontendUrl}?google_tokens=${tokenParam}`);
     } else {
-      res.json({ success: true, message: 'Google Calendar connected.' });
+      res.json({ success: true, tokens });
     }
   } catch (err: any) {
     console.error('Google OAuth error:', err?.message);
@@ -97,26 +101,27 @@ app.get('/api/google/callback', async (req, res) => {
   }
 });
 
-app.get('/api/google/status', (_req, res) => {
-  res.json({ authenticated: isAuthenticated() });
-});
-
-// --- Calendar batch add ---
+// --- Calendar batch add (multi-user) ---
+// Frontend sends google_tokens alongside events.
 
 app.post('/api/calendar/add', async (req, res) => {
-  if (!isAuthenticated()) {
-    res.status(401).json({ error: 'Google Calendar not connected. Please authenticate first.' });
+  const { events, google_tokens } = req.body as {
+    events?: CalendarEventRequest[];
+    google_tokens?: any;
+  };
+
+  if (!google_tokens) {
+    res.status(401).json({ error: 'Missing google_tokens. Please connect Google Calendar first.' });
     return;
   }
 
-  const { events } = req.body as { events?: CalendarEventRequest[] };
   if (!events || !Array.isArray(events) || events.length === 0) {
     res.status(400).json({ error: 'Missing or empty "events" array in request body.' });
     return;
   }
 
   try {
-    const result = await addEventsToCalendar(events);
+    const result = await addEventsToCalendar(google_tokens, events);
     res.json({ success: true, ...result });
   } catch (err: any) {
     console.error('Calendar add error:', err?.message);

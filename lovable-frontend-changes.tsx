@@ -208,52 +208,69 @@ export function AshbyExtract({ onExtract }: AshbyExtractProps) {
 //   // In the header actions area, add next to AshbyFetchButton:
 //   <GoogleCalendarSync candidates={filteredCandidates} />
 //
-// Component implementation for Lovable:
+// Component implementation for Lovable (multi-user):
+// Each user's Google tokens are stored in their browser's localStorage.
+// Tokens are sent with each calendar request — no server-side user storage.
 
-import { useState, useEffect, useCallback } from "react";
-import { Calendar, Loader2, Check } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Calendar, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { Candidate } from "@/data/candidates";
 
 const API_URL = "https://ashby-automation-production.up.railway.app";
+const TOKENS_KEY = "google_calendar_tokens";
+
+function getStoredTokens(): any | null {
+  try {
+    const raw = localStorage.getItem(TOKENS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeTokens(tokens: any): void {
+  localStorage.setItem(TOKENS_KEY, JSON.stringify(tokens));
+}
+
+export function clearGoogleTokens(): void {
+  localStorage.removeItem(TOKENS_KEY);
+}
 
 interface GoogleCalendarSyncProps {
   candidates: Candidate[];
 }
 
 export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
-  const [googleAuth, setGoogleAuth] = useState(false);
+  const [hasTokens, setHasTokens] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [checkingAuth, setCheckingAuth] = useState(true);
-
-  const checkAuth = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_URL}/api/google/status`);
-      const data = await res.json();
-      setGoogleAuth(data.authenticated);
-    } catch {
-      // Server unreachable — leave as not authenticated
-    } finally {
-      setCheckingAuth(false);
-    }
-  }, []);
 
   useEffect(() => {
-    checkAuth();
-    // Check if returning from OAuth redirect
+    // Check if returning from OAuth redirect with tokens
     const params = new URLSearchParams(window.location.search);
-    if (params.get("google_auth") === "success") {
-      setGoogleAuth(true);
-      toast.success("Google Calendar connected!");
+    const tokenParam = params.get("google_tokens");
+    if (tokenParam) {
+      try {
+        const tokens = JSON.parse(decodeURIComponent(tokenParam));
+        storeTokens(tokens);
+        setHasTokens(true);
+        toast.success("Google Calendar connected!");
+      } catch {
+        toast.error("Failed to save Google tokens.");
+      }
       // Clean up URL
-      params.delete("google_auth");
+      params.delete("google_tokens");
       const newUrl = params.toString()
         ? `${window.location.pathname}?${params}`
         : window.location.pathname;
       window.history.replaceState({}, "", newUrl);
+      return;
     }
-  }, [checkAuth]);
+
+    // Check localStorage
+    setHasTokens(!!getStoredTokens());
+  }, []);
 
   const handleConnect = async () => {
     try {
@@ -268,6 +285,13 @@ export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
   };
 
   const handleSync = async () => {
+    const tokens = getStoredTokens();
+    if (!tokens) {
+      toast.error("Google Calendar not connected. Please connect first.");
+      setHasTokens(false);
+      return;
+    }
+
     const now = new Date();
     const events = candidates.flatMap((c) =>
       (c.interview_events || [])
@@ -291,12 +315,19 @@ export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
       const res = await fetch(`${API_URL}/api/calendar/add`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ events }),
+        body: JSON.stringify({ events, google_tokens: tokens }),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
+        if (res.status === 401) {
+          // Token expired — clear and prompt re-auth
+          clearGoogleTokens();
+          setHasTokens(false);
+          toast.error("Google session expired. Please reconnect.");
+          return;
+        }
         toast.error(data.error || "Failed to add calendar events.");
         return;
       }
@@ -315,9 +346,7 @@ export function GoogleCalendarSync({ candidates }: GoogleCalendarSyncProps) {
     }
   };
 
-  if (checkingAuth) return null;
-
-  if (!googleAuth) {
+  if (!hasTokens) {
     return (
       <Button variant="outline" size="sm" className="gap-2" onClick={handleConnect}>
         <Calendar className="h-4 w-4" />

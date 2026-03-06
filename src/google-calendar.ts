@@ -1,71 +1,36 @@
 /**
- * google-calendar.ts -- Google OAuth2 and Calendar API integration.
+ * google-calendar.ts -- Google OAuth2 and Calendar API integration (multi-user).
  *
- * Handles:
- *   - OAuth2 auth URL generation and token exchange
- *   - In-memory token storage with file-based persistence
- *   - Batch calendar event creation with duplicate detection
+ * Tokens are NOT stored server-side. Instead:
+ *   1. Server generates the OAuth URL and exchanges the auth code for tokens
+ *   2. Tokens are returned to the frontend, which stores them in localStorage
+ *   3. Frontend sends tokens with each /api/calendar/add request
+ *   4. Server creates a per-request OAuth client using those tokens
  */
 import { google } from 'googleapis';
-import fs from 'node:fs';
 
-const TOKEN_FILE = '/tmp/google-tokens.json';
-
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI,
-);
-
-// --- Token management ---
-
-let storedTokens: any = null;
-
-function loadTokensFromDisk(): void {
-  try {
-    const data = fs.readFileSync(TOKEN_FILE, 'utf8');
-    storedTokens = JSON.parse(data);
-    oauth2Client.setCredentials(storedTokens);
-    console.log('Loaded Google tokens from disk');
-  } catch {
-    // No saved tokens — user needs to authenticate
-  }
-}
-
-// Load on startup
-loadTokensFromDisk();
-
-function saveTokensToDisk(tokens: any): void {
-  try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens), 'utf8');
-  } catch (err) {
-    console.error('Failed to persist Google tokens:', err);
-  }
-}
-
-export function setTokens(tokens: any): void {
-  storedTokens = tokens;
-  oauth2Client.setCredentials(tokens);
-  saveTokensToDisk(tokens);
-}
-
-export function isAuthenticated(): boolean {
-  return !!storedTokens;
+function makeOAuth2Client() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI,
+  );
 }
 
 // --- OAuth flow ---
 
 export function getAuthUrl(): string {
-  return oauth2Client.generateAuthUrl({
+  return makeOAuth2Client().generateAuthUrl({
     access_type: 'offline',
     scope: ['https://www.googleapis.com/auth/calendar.events'],
     prompt: 'consent',
   });
 }
 
-export async function exchangeCode(code: string): Promise<void> {
-  const { tokens } = await oauth2Client.getToken(code);
-  setTokens(tokens);
+export async function exchangeCode(code: string): Promise<any> {
+  const client = makeOAuth2Client();
+  const { tokens } = await client.getToken(code);
+  return tokens;
 }
 
 // --- Calendar operations ---
@@ -86,9 +51,13 @@ interface AddEventsResult {
   details: string[];
 }
 
-export async function addEventsToCalendar(events: CalendarEventRequest[]): Promise<AddEventsResult> {
-  oauth2Client.setCredentials(storedTokens);
-  const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+export async function addEventsToCalendar(
+  tokens: any,
+  events: CalendarEventRequest[],
+): Promise<AddEventsResult> {
+  const client = makeOAuth2Client();
+  client.setCredentials(tokens);
+  const calendar = google.calendar({ version: 'v3', auth: client });
 
   const now = new Date();
   const result: AddEventsResult = { created: 0, skipped_past: 0, skipped_duplicate: 0, errors: 0, details: [] };
