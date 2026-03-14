@@ -91,6 +91,18 @@ interface ApplicationResult {
   job: {
     id: string;
     title: string;
+    interviewPlansWithActivities?: Array<{
+      id: string;
+      isDefault: boolean;
+      interviewPlan?: {
+        id: string;
+        interviewStages?: Array<{
+          id: string;
+          title: string;
+          stageType: string;
+        }>;
+      };
+    }>;
     __typename: string;
   };
   candidate: {
@@ -121,11 +133,55 @@ interface ApplicationResult {
   createdAt: string;
   currentInterviewStage: {
     id: string;
-    title?: string; // Stage name like "Technical Interviews", "Hard Skills Check"
+    title?: string;
     interviewPlanId: string;
     stageType: string;
     __typename: string;
   } | null;
+  interviewPlan?: {
+    id: string;
+    interviewStages: Array<{
+      id: string;
+      title: string;
+      stageType: string;
+    }>;
+  } | null;
+  interviewEvents?: Array<{
+    id: string;
+    startTime: string;
+    endTime: string;
+    interview: {
+      id: string;
+      title: string;
+    };
+    interviewerEvents: Array<{
+      id: string;
+      interviewer: {
+        id: string;
+        firstName: string;
+        lastName: string;
+        email: string;
+      };
+      scorecardSubmission?: {
+        id?: string;
+        overallRecommendation?: string;
+        submittedAt?: string;
+        submittedFormRender?: {
+          fieldEntries?: Array<{
+            field: string;
+            fieldValue?: { value?: any };
+          }>;
+          sections?: Array<{
+            fieldEntries?: Array<{
+              field: string;
+              fieldValue?: { value?: any };
+            }>;
+          }>;
+        };
+      } | null;
+      isFeedbackSubmitted: boolean;
+    }>;
+  }>;
   extraFields: Record<string, unknown>;
   __typename: string;
 }
@@ -453,62 +509,30 @@ export async function fetchPipelineForOrg(
     console.log(`  Fetching pipeline data for current org context`);
   }
   
-  // Step 1: Fetch open jobs
-  const openJobsQuery = `
-    query ApiOpenJobs($onlyIncludeOpenJobs: Boolean = true, $onlyIncludeJobsUserFollowsOrHasRole: Boolean = false) {
-      jobsPipelines(
-        onlyIncludeOpenJobs: $onlyIncludeOpenJobs
-        onlyIncludeJobsUserFollowsOrHasRole: $onlyIncludeJobsUserFollowsOrHasRole
-      ) {
-        jobId
-        jobTitle
-        jobLocationName
-        customRequisitionId
-        confidential
-        userFollowsOrHasRole
-        applicationCount
-        __typename
-      }
-    }
-  `;
-
-  let jobsData: JobsPipelinesResponse;
-  try {
-    jobsData = await graphqlQuery<JobsPipelinesResponse>(
-      session,
-      'ApiOpenJobs',
-      openJobsQuery,
-      {
-        onlyIncludeOpenJobs: true,
-        onlyIncludeJobsUserFollowsOrHasRole: false
-      },
-      switchedOrg // Force refresh CSRF token if we just switched orgs
-    );
-    console.log(`Found ${jobsData.jobsPipelines.length} open jobs`);
-  } catch (error) {
-    console.error('Error fetching jobs:', error);
-    throw error;
-  }
-
-  // Step 2: Fetch active applications for all open jobs
-  // We'll use applicationsByPrebuiltView with ApplicationActive view
-  const applicationsQuery = `
-    query ApiGetActiveApplications($customFilter: JSON, $extraFields: [String], $orderByFields: [OrderByFieldInput], $cursor: String, $searchTerm: String, $queryContext: JSON, $limit: Int) {
-      result: applicationsByPrebuiltView(
-        prebuiltView: Active
-        customFilter: $customFilter
-        extraFields: $extraFields
-        orderByFields: $orderByFields
-        cursor: $cursor
-        searchTerm: $searchTerm
-        queryContext: $queryContext
-        limit: $limit
-      ) {
-        results {
+  // Application fields fragment (shared between initial combined query and pagination queries)
+  const applicationFieldsFragment = `
           id
           job {
             id
             title
+            interviewPlansWithActivities {
+              id
+              isDefault
+              interviewPlan {
+                ... on CustomInterviewPlan {
+                  id
+                  interviewStages { id title stageType __typename }
+                  __typename
+                }
+                ... on InterviewPlanTemplate {
+                  id
+                  interviewStages { id title stageType __typename }
+                  __typename
+                }
+                __typename
+              }
+              __typename
+            }
             __typename
           }
           candidate {
@@ -553,78 +577,232 @@ export async function fetchPipelineForOrg(
             stageType
             __typename
           }
+          interviewPlan {
+            id
+            interviewStages {
+              id
+              title
+              stageType
+              __typename
+            }
+            __typename
+          }
+          interviewEvents {
+            id
+            startTime
+            endTime
+            interview {
+              id
+              title
+              __typename
+            }
+            interviewerEvents {
+              id
+              interviewer {
+                id
+                firstName
+                lastName
+                email
+                __typename
+              }
+              scorecardSubmission {
+                ... on Scorecard {
+                  id
+                  overallRecommendation
+                  submittedAt
+                  submittedFormRender {
+                    id
+                    fieldEntries {
+                      id
+                      field
+                      fieldValue {
+                        ... on JSONBox { value __typename }
+                        __typename
+                      }
+                      __typename
+                    }
+                    sections {
+                      fieldEntries {
+                        id
+                        field
+                        fieldValue {
+                          ... on JSONBox { value __typename }
+                          __typename
+                        }
+                        __typename
+                      }
+                      __typename
+                    }
+                    __typename
+                  }
+                  __typename
+                }
+                ... on ScorecardPermissionDenied { reason __typename }
+                __typename
+              }
+              isFeedbackSubmitted
+              __typename
+            }
+            __typename
+          }
           extraFields
-          __typename
+          __typename`;
+
+  // Step 1: Combined initial query — jobs + first page of applications + session user in one request
+  const initialQuery = `
+    query InitialFetch(
+      $onlyIncludeOpenJobs: Boolean = true,
+      $onlyIncludeJobsUserFollowsOrHasRole: Boolean = false,
+      $customFilter: JSON,
+      $extraFields: [String],
+      $orderByFields: [OrderByFieldInput],
+      $cursor: String,
+      $searchTerm: String,
+      $queryContext: JSON,
+      $limit: Int
+    ) {
+      jobsPipelines(
+        onlyIncludeOpenJobs: $onlyIncludeOpenJobs
+        onlyIncludeJobsUserFollowsOrHasRole: $onlyIncludeJobsUserFollowsOrHasRole
+      ) {
+        jobId
+        jobTitle
+        jobLocationName
+        customRequisitionId
+        confidential
+        userFollowsOrHasRole
+        applicationCount
+        __typename
+      }
+      result: applicationsByPrebuiltView(
+        prebuiltView: Active
+        customFilter: $customFilter
+        extraFields: $extraFields
+        orderByFields: $orderByFields
+        cursor: $cursor
+        searchTerm: $searchTerm
+        queryContext: $queryContext
+        limit: $limit
+      ) {
+        results {
+${applicationFieldsFragment}
         }
         nextCursor
         moreDataAvailable
         opaqueFilter
         __typename
       }
+      user: sessionUserV2 {
+        organizationId
+        organizationName
+        __typename
+      }
     }
   `;
 
+  interface InitialFetchResponse extends JobsPipelinesResponse, ApplicationsResponse {
+    user: { organizationId: string; organizationName: string };
+  }
+
+  let jobsData: JobsPipelinesResponse;
   const allApplications: ApplicationResult[] = [];
   let cursor: string | null = null;
   let hasMore = true;
+  let orgName: string | undefined;
 
-  // Fetch all pages of applications
+  // Fetch initial combined data (jobs + first app page + session user)
   try {
-    while (hasMore) {
-      const appsData: ApplicationsResponse = await graphqlQuery<ApplicationsResponse>(
-        session,
-        'ApiGetActiveApplications',
-        applicationsQuery,
-        {
-          customFilter: null,
-          extraFields: [],
-          orderByFields: [{ field: 'submitted_at', ascending: false }],
-          cursor,
-          searchTerm: '',
-          queryContext: null,
-          limit: 100
-        },
-        false // Only force refresh on first call after switch
-      );
+    const initialData = await graphqlQuery<InitialFetchResponse>(
+      session,
+      'InitialFetch',
+      initialQuery,
+      {
+        onlyIncludeOpenJobs: true,
+        onlyIncludeJobsUserFollowsOrHasRole: false,
+        customFilter: null,
+        extraFields: [],
+        orderByFields: [{ field: 'submitted_at', ascending: false }],
+        cursor: null,
+        searchTerm: '',
+        queryContext: null,
+        limit: 100
+      },
+      switchedOrg
+    );
 
-      allApplications.push(...appsData.result.results);
-      cursor = appsData.result.nextCursor;
-      hasMore = appsData.result.moreDataAvailable;
-      console.log(`Fetched ${appsData.result.results.length} applications (total: ${allApplications.length}, more: ${hasMore})`);
+    jobsData = { jobsPipelines: initialData.jobsPipelines };
+    console.log(`Found ${jobsData.jobsPipelines.length} open jobs`);
+
+    allApplications.push(...initialData.result.results);
+    cursor = initialData.result.nextCursor;
+    hasMore = initialData.result.moreDataAvailable;
+    console.log(`Fetched ${initialData.result.results.length} applications (total: ${allApplications.length}, more: ${hasMore})`);
+
+    if (initialData.user.organizationId === orgId) {
+      orgName = initialData.user.organizationName;
     }
-    console.log(`Total applications fetched: ${allApplications.length}`);
   } catch (error) {
-    console.error('Error fetching applications:', error);
-    // Continue with empty applications if this fails
-    console.log('Continuing with empty applications list');
+    console.error('Error in initial combined fetch:', error);
+    throw error;
   }
 
-  // Step 3: Get org info for this orgId
-  let orgName: string | undefined;
-  try {
-    const sessionUserQuery = `
-      query ApiGetSessionUser {
-        user: sessionUserV2 {
-          organizationId
-          organizationName
+  // Fetch remaining pages of applications (cursor-dependent, must be sequential)
+  if (hasMore) {
+    const paginationQuery = `
+      query ApiGetActiveApplications($customFilter: JSON, $extraFields: [String], $orderByFields: [OrderByFieldInput], $cursor: String, $searchTerm: String, $queryContext: JSON, $limit: Int) {
+        result: applicationsByPrebuiltView(
+          prebuiltView: Active
+          customFilter: $customFilter
+          extraFields: $extraFields
+          orderByFields: $orderByFields
+          cursor: $cursor
+          searchTerm: $searchTerm
+          queryContext: $queryContext
+          limit: $limit
+        ) {
+          results {
+${applicationFieldsFragment}
+          }
+          nextCursor
+          moreDataAvailable
+          opaqueFilter
           __typename
         }
       }
     `;
-    const userResponse = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
-      session,
-      'ApiGetSessionUser',
-      sessionUserQuery
-    );
-    if (userResponse.user.organizationId === orgId) {
-      orgName = userResponse.user.organizationName;
+
+    try {
+      while (hasMore) {
+        const appsData: ApplicationsResponse = await graphqlQuery<ApplicationsResponse>(
+          session,
+          'ApiGetActiveApplications',
+          paginationQuery,
+          {
+            customFilter: null,
+            extraFields: [],
+            orderByFields: [{ field: 'submitted_at', ascending: false }],
+            cursor,
+            searchTerm: '',
+            queryContext: null,
+            limit: 100
+          },
+          false
+        );
+
+        allApplications.push(...appsData.result.results);
+        cursor = appsData.result.nextCursor;
+        hasMore = appsData.result.moreDataAvailable;
+        console.log(`Fetched ${appsData.result.results.length} applications (total: ${allApplications.length}, more: ${hasMore})`);
+      }
+    } catch (error) {
+      console.error('Error fetching application pages:', error);
+      console.log(`Continuing with ${allApplications.length} applications fetched so far`);
     }
-  } catch (error) {
-    // If we can't get org name, we'll just use the orgId
-    console.warn(`Could not fetch org name for ${orgId}, using ID only`);
   }
 
-  // Step 4: Normalize the data
+  console.log(`Total applications fetched: ${allApplications.length}`);
+
+  // Normalize the data (including enrichment data from expanded query)
   return normalizePipelineData(jobsData.jobsPipelines, allApplications, orgId, orgName);
 }
 
@@ -709,12 +887,6 @@ function normalizePipelineData(
     // True if: stage is interview-type AND no activity >= 7 days
     const needsScheduling = computeNeedsScheduling(stageType, daysInStage);
 
-    // Interview stage progression - not available from API yet
-    // TODO: These fields would require additional API endpoints or schema changes
-    const currentStageIndex: number | null = null;
-    const totalStages: number | null = null;
-    const stageProgress: string | null = null;
-
     // Extract attribution (credited to)
     const creditedTo = app.creditedToUser
       ? `${app.creditedToUser.firstName} ${app.creditedToUser.lastName}`.trim() || app.creditedToUser.email
@@ -723,14 +895,76 @@ function normalizePipelineData(
     // Extract source
     const source = app.source?.title || null;
 
+    // --- Enrichment: extract interview events, feedback, and stage progress inline ---
+    const interviewEvents = (app.interviewEvents || []).map((event) => ({
+      id: event.id,
+      interviewTitle: event.interview.title,
+      startTime: event.startTime,
+      endTime: event.endTime,
+      interviewers: event.interviewerEvents.map((ie) => ({
+        name: `${ie.interviewer.firstName} ${ie.interviewer.lastName}`,
+        email: ie.interviewer.email,
+        overallRecommendation: ie.scorecardSubmission?.overallRecommendation || null,
+        isFeedbackSubmitted: ie.isFeedbackSubmitted
+      }))
+    }));
+
+    const allFeedback = (app.interviewEvents || []).flatMap((event) =>
+      event.interviewerEvents
+        .filter((ie) => ie.isFeedbackSubmitted)
+        .map((ie) => ({
+          interviewTitle: event.interview.title,
+          interviewer: `${ie.interviewer.firstName} ${ie.interviewer.lastName}`,
+          interviewerEmail: ie.interviewer.email,
+          submittedAt: ie.scorecardSubmission?.submittedAt || event.endTime,
+          overallRecommendation: ie.scorecardSubmission?.overallRecommendation || null,
+          feedbackText: extractFeedbackText(ie.scorecardSubmission?.submittedFormRender),
+          isFeedbackSubmitted: ie.isFeedbackSubmitted
+        }))
+    );
+
+    const sortedFeedback = allFeedback
+      .filter(f => f.submittedAt)
+      .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    const latestFeedback = sortedFeedback[0];
+
+    // Calculate stage position in the pipeline
+    let currentStageIndex: number | null = null;
+    let totalStages: number | null = null;
+    let stageProgress: string | null = null;
+
+    let interviewPlan = app.interviewPlan;
+    if (!interviewPlan && app.job?.interviewPlansWithActivities) {
+      const defaultPlanConfig = app.job.interviewPlansWithActivities.find(
+        (p) => p.isDefault === true
+      );
+      if (defaultPlanConfig?.interviewPlan?.interviewStages) {
+        interviewPlan = defaultPlanConfig.interviewPlan as NonNullable<typeof interviewPlan>;
+      }
+    }
+
+    if (interviewPlan && app.currentInterviewStage) {
+      const allStages = interviewPlan.interviewStages;
+      const filteredStages = allStages.filter((s) => {
+        const st = s.stageType || '';
+        return st === 'Active' || st === 'Offer';
+      });
+      totalStages = filteredStages.length;
+      const stageIdx = filteredStages.findIndex((s) => s.id === app.currentInterviewStage!.id);
+      if (stageIdx !== -1) {
+        currentStageIndex = stageIdx + 1;
+        stageProgress = `${currentStageIndex}/${totalStages}`;
+      }
+    }
+
     candidates.push({
       id: app.candidate.id,
-      applicationId: app.id, // Store application ID for detailed queries
+      applicationId: app.id,
       name: app.candidate.name,
       email: null,
       phone: null,
       currentStage,
-      pipelineStage, // Capture from initial query
+      pipelineStage,
       stageType,
       currentStageIndex,
       totalStages,
@@ -753,7 +987,13 @@ function normalizePipelineData(
       resumeUrl: null,
       linkedInUrl: null,
       githubUrl: null,
-      websiteUrl: null
+      websiteUrl: null,
+      interviewEvents,
+      allFeedback,
+      latestOverallRecommendation: latestFeedback?.overallRecommendation || null,
+      latestFeedbackAuthor: latestFeedback?.interviewer || undefined,
+      latestFeedbackDate: latestFeedback?.submittedAt || undefined,
+      feedbackCount: allFeedback.length
     });
   }
 

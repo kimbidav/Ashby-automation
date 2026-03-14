@@ -16,7 +16,7 @@
  *   orgFilter         — Case-insensitive name filter to run on a single org
  */
 import { loadSession } from './session.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, enrichCandidatesWithDetails } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';
 import { exportJSON, exportCSV } from './export.js';
 import { Company, Job, Candidate } from './types.js';
 
@@ -152,10 +152,6 @@ export async function extractCommand(options: ExtractOptions): Promise<void> {
       }
     }
 
-    // Small delay between orgs to avoid rate limiting
-    if (i < orgsToProcess.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
   }
 
   // Summary
@@ -182,21 +178,6 @@ export async function extractCommand(options: ExtractOptions): Promise<void> {
   console.log(`   - ${allCompanies.length} companies`);
   console.log(`   - ${allJobs.length} jobs`);
   console.log(`   - ${allCandidates.length} candidates\n`);
-
-  // Enrich candidates with detailed feedback if requested
-  if (options.detailed) {
-    console.log('🔍 Fetching detailed interview feedback and ratings...\n');
-    try {
-      allCandidates = await enrichCandidatesWithDetails(session, allCandidates, orgInfos, {
-        maxConcurrent: options.detailedConcurrent || 5,
-        fetchAll: true // Fetch details for all candidates
-      });
-      console.log(`✓ Enriched ${allCandidates.length} candidates with interview details\n`);
-    } catch (error: any) {
-      console.error('⚠️  Error during enrichment:', error?.message || error);
-      console.error('   Continuing with basic data...\n');
-    }
-  }
 
   // Export
   if (options.json) {

@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, enrichCandidatesWithDetails } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -114,24 +114,10 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
       console.error(`  Failed: ${err?.message?.substring(0, 150)}`);
     }
 
-    // Small delay between orgs
-    if (i < orgInfos.length - 1) {
-      await new Promise((r) => setTimeout(r, 500));
-    }
   }
 
   if (allCandidates.length === 0) {
     throw new Error('No candidates extracted from any organization. Session may be expired.');
-  }
-
-  // Enrich with detailed interview data
-  try {
-    allCandidates = await enrichCandidatesWithDetails(session, allCandidates, orgInfos, {
-      maxConcurrent: 5,
-      fetchAll: true,
-    });
-  } catch (err: any) {
-    console.error('Enrichment error (continuing with basic data):', err?.message);
   }
 
   // Convert to the flat snake_case format the frontend expects

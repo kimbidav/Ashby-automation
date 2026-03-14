@@ -172,12 +172,12 @@ Ashby Automation/
 │   ├── cli.ts              # Entry point — CLI commands (auth, auth-cookie, recon, extract)
 │   ├── types.ts            # Shared TypeScript interfaces (Candidate, AshbySession, etc.)
 │   ├── session.ts          # Auth & session management (.ashby-session.json)
-│   ├── client.ts           # Ashby GraphQL API client — org switching, pipeline fetch, enrichment
+│   ├── client.ts           # Ashby GraphQL API client — org switching, pipeline fetch with inline enrichment
 │   ├── api-extract.ts      # Orchestration for the extract command
 │   ├── export.ts           # CSV and JSON export
 │   ├── recon.ts            # Dev tool: captures live API traffic to ashby-recon-log.json
 │   └── recon-parser.ts     # Dev tool: reads the recon log to extract GraphQL queries
-├── query_ApiApplication.graphql  # GraphQL query used by --detailed enrichment
+├── query_ApiApplication.graphql  # Full GraphQL query for single-application detail (legacy fallback)
 ├── output/                 # Generated reports (timestamped, gitignored)
 ├── dist/                   # Compiled JavaScript (gitignored)
 ├── run_ashby_extract.sh    # Convenience wrapper with session expiry detection
@@ -288,9 +288,9 @@ Uses `/api/auth/change_user/{userId}` to switch between organization contexts, a
 
 ### Data Extraction
 
-Uses two main GraphQL queries:
-1. `ApiOpenJobs` - Fetches all open job postings
-2. `ApiGetActiveApplications` - Fetches active candidate applications with pagination
+Uses a combined initial GraphQL query (`InitialFetch`) that fetches jobs, the first page of applications, and session user info in a single HTTP request. The applications query includes full interview events, scorecard feedback, and interview plan data inline — eliminating the need for a separate per-candidate enrichment phase.
+
+Subsequent application pages are fetched sequentially (cursor-based pagination) with the same expanded field set.
 
 ### Needs Scheduling Logic
 
