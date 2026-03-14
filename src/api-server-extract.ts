@@ -14,6 +14,13 @@ export interface ExtractedInterviewEvent {
   interview_title: string;
   start_time: string;
   end_time: string;
+  interviewers: Array<{
+    name: string;
+    email: string;
+    score: string | null;
+    feedback_submitted: boolean;
+    feedback_text: string | null;
+  }>;
 }
 
 export interface ExtractedCandidate {
@@ -38,6 +45,10 @@ export interface ExtractedCandidate {
   latest_feedback_author: string;
   latest_feedback_date: string;
   interview_events: ExtractedInterviewEvent[];
+  current_stage_interviews: string;
+  current_stage_avg_score: number | null;
+  current_stage_date: string;
+  interview_history_summary: string;
 }
 
 export interface ExtractResult {
@@ -128,6 +139,77 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
     const company = companyById.get(cand.companyId);
     const job = jobById.get(cand.jobId);
 
+    // Compute interview summary strings (same logic as export.ts CSV)
+    let currentStageInterviews = '';
+    let currentStageAvgScore: number | null = null;
+    let currentStageDate = '';
+    let interviewHistorySummary = '';
+
+    if (cand.interviewEvents && cand.interviewEvents.length > 0) {
+      const sortedEvents = [...cand.interviewEvents].sort((a, b) =>
+        new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+      );
+
+      const mostRecentDate = new Date(sortedEvents[0].startTime);
+      const currentInterviews: typeof sortedEvents = [];
+      const previousInterviews: typeof sortedEvents = [];
+
+      for (const event of sortedEvents) {
+        const daysDiff = (mostRecentDate.getTime() - new Date(event.startTime).getTime()) / (24 * 60 * 60 * 1000);
+        if (daysDiff <= 1) {
+          currentInterviews.push(event);
+        } else {
+          previousInterviews.push(event);
+        }
+      }
+
+      if (currentInterviews.length > 0) {
+        const parts = currentInterviews.map(event => {
+          const d = new Date(event.startTime);
+          const dateStr = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+          return event.interviewers.map(interviewer => {
+            const score = interviewer.overallRecommendation
+              ? `Score: ${interviewer.overallRecommendation}`
+              : 'No score yet';
+            let feedbackSnippet = '';
+            if (cand.allFeedback && cand.allFeedback.length > 0) {
+              const match = cand.allFeedback.find(
+                fb => fb.interviewTitle === event.interviewTitle && fb.interviewer === interviewer.name
+              );
+              if (match?.feedbackText) {
+                feedbackSnippet = ` (${match.feedbackText})`;
+              }
+            }
+            return `• ${event.interviewTitle} (${dateStr}) - ${interviewer.name} - ${score}${feedbackSnippet}`;
+          }).join('\n');
+        });
+        currentStageInterviews = parts.join('\n');
+
+        const scores = currentInterviews.flatMap(e =>
+          e.interviewers
+            .filter(i => i.overallRecommendation)
+            .map(i => parseFloat(String(i.overallRecommendation)))
+        );
+        if (scores.length > 0) {
+          currentStageAvgScore = parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1));
+        }
+        currentStageDate = new Date(currentInterviews[0].startTime).toISOString().split('T')[0];
+      }
+
+      if (previousInterviews.length > 0) {
+        interviewHistorySummary = previousInterviews.map(event => {
+          const dateStr = new Date(event.startTime).toISOString().split('T')[0];
+          const scores = event.interviewers
+            .filter(i => i.overallRecommendation)
+            .map(i => String(i.overallRecommendation));
+          const avgScore = scores.length > 0
+            ? (scores.reduce((a, b) => a + parseFloat(b), 0) / scores.length).toFixed(1)
+            : 'N/A';
+          return `${dateStr}: ${event.interviewTitle} (${avgScore})`;
+        }).join(' | ');
+      }
+    }
+
     return {
       company_name: cand.orgName || company?.name || '',
       job_title: job?.title ?? '',
@@ -149,12 +231,29 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
       latest_recommendation: cand.latestOverallRecommendation ?? '',
       latest_feedback_author: cand.latestFeedbackAuthor ?? '',
       latest_feedback_date: cand.latestFeedbackDate ?? '',
-      interview_events: (cand.interviewEvents || []).map((ev) => ({
-        id: ev.id,
-        interview_title: ev.interviewTitle,
-        start_time: ev.startTime,
-        end_time: ev.endTime,
-      })),
+      interview_events: (cand.interviewEvents || []).map((ev) => {
+        // Find matching feedback for each interviewer
+        const feedbackByInterviewer = new Map(
+          (cand.allFeedback || []).map(fb => [`${fb.interviewTitle}:${fb.interviewer}`, fb])
+        );
+        return {
+          id: ev.id,
+          interview_title: ev.interviewTitle,
+          start_time: ev.startTime,
+          end_time: ev.endTime,
+          interviewers: ev.interviewers.map(i => ({
+            name: i.name,
+            email: i.email,
+            score: i.overallRecommendation ? String(i.overallRecommendation) : null,
+            feedback_submitted: i.isFeedbackSubmitted,
+            feedback_text: feedbackByInterviewer.get(`${ev.interviewTitle}:${i.name}`)?.feedbackText || null,
+          })),
+        };
+      }),
+      current_stage_interviews: currentStageInterviews,
+      current_stage_avg_score: currentStageAvgScore,
+      current_stage_date: currentStageDate,
+      interview_history_summary: interviewHistorySummary,
     };
   });
 

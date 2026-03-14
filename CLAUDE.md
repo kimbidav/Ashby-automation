@@ -150,6 +150,30 @@ For each candidate, the following is extracted in a single bulk query (no per-ca
 | `feedbackCount` | Count of submitted scorecards | 2 |
 | `creditedTo` / `source` | `creditedToUser` / `source.title` | "David Kimball" / "Candidate Labs" |
 
+## API Server Response (`POST /api/extract`)
+
+The API server returns candidates in snake_case with computed interview summary fields for the Lovable frontend:
+
+```typescript
+{
+  // ... basic fields (company_name, job_title, pipeline_stage, etc.)
+
+  // Interview events with full interviewer/feedback detail
+  interview_events: [{
+    id, interview_title, start_time, end_time,
+    interviewers: [{ name, email, score, feedback_submitted, feedback_text }]
+  }],
+
+  // Pre-formatted strings for the expanded row view
+  current_stage_interviews: "• Coding Interview (03/11) - Zi Gao - Score: 3 (Good communicator...)",
+  current_stage_avg_score: 3.0,
+  current_stage_date: "2026-03-11",
+  interview_history_summary: "2026-02-23: Initial Team Screen (3.0) | 2026-01-15: Phone Screen (N/A)",
+}
+```
+
+The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `CandidateTable.tsx` renders `current_stage_interviews` and `interview_history_summary` in expandable row details.
+
 ## Common Pitfalls
 
 - **Session invalidation**: The `switchOrgContext` function modifies `session.cookies` in-place (from `set-cookie` response headers). If the process crashes mid-extraction, the saved session file may have stale cookies.
