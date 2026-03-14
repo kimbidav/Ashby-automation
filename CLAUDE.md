@@ -121,6 +121,35 @@ npm run start -- auth-cookie --cookie "paste_token_here"
 
 The cookie value is the `ashby_session_token` from Chrome DevTools > Application > Cookies > `app.ashbyhq.com`.
 
+## Feedback Text Extraction
+
+Scorecard feedback in Ashby has two formats:
+- **Plain text** (e.g., TLDR field): stored as a string value
+- **Rich text** (e.g., Positives, Negatives): stored as ProseMirror JSON `{"content":{"type":"doc","content":[...]}}`
+
+The `extractFeedbackText()` function in `client.ts` handles both:
+1. Iterates all `fieldEntries` in the `submittedFormRender` (top-level and inside sections)
+2. Skips numeric values (likely the recommendation score)
+3. Extracts plain strings directly
+4. Walks ProseMirror JSON trees to extract text nodes
+5. Joins all parts with ` | ` separator
+
+Note: the `field` property in `fieldEntries` is an **object** (not a string) in Ashby's GraphQL schema. Any code that filters by field name must handle this.
+
+## Per-Candidate Data Available
+
+For each candidate, the following is extracted in a single bulk query (no per-candidate API calls):
+
+| Field | Source | Example |
+|-------|--------|---------|
+| `pipelineStage` | `currentInterviewStage.title` | "Follow-up Interview" |
+| `stageProgress` | Computed from `interviewPlan` stages | "4/6" |
+| `interviewEvents[]` | `interviewEvents` with interviewer details | Title, date, interviewer name/email, score |
+| `allFeedback[]` | `scorecardSubmission.submittedFormRender` | TLDR + rich text positives/negatives |
+| `latestOverallRecommendation` | Most recent scorecard | "3" |
+| `feedbackCount` | Count of submitted scorecards | 2 |
+| `creditedTo` / `source` | `creditedToUser` / `source.title` | "David Kimball" / "Candidate Labs" |
+
 ## Common Pitfalls
 
 - **Session invalidation**: The `switchOrgContext` function modifies `session.cookies` in-place (from `set-cookie` response headers). If the process crashes mid-extraction, the saved session file may have stale cookies.

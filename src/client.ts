@@ -1034,52 +1034,66 @@ function computeNeedsScheduling(
  * Extract feedback text from submittedFormRender
  * Looks for common feedback field names like "overallFeedback", "feedback", "comments", etc.
  */
+function extractTextFromRichText(richText: any): string | null {
+  if (!richText || typeof richText !== 'object') return null;
+
+  // ProseMirror structure: { content: { type: "doc", content: [...nodes] } }
+  // or sometimes directly: { type: "doc", content: [...nodes] }
+  const texts: string[] = [];
+  function walk(node: any) {
+    if (!node || typeof node !== 'object') return;
+    if (node.text && typeof node.text === 'string') {
+      texts.push(node.text);
+    }
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) walk(child);
+    }
+    // Handle the outer wrapper: { content: { type: "doc", content: [...] } }
+    if (node.content && typeof node.content === 'object' && !Array.isArray(node.content)) {
+      walk(node.content);
+    }
+  }
+  walk(richText);
+  return texts.length > 0 ? texts.join(' ').trim() : null;
+}
+
 function extractFeedbackText(submittedFormRender?: any): string | null {
   if (!submittedFormRender) return null;
 
-  const feedbackFieldNames = [
-    'overallFeedback',
-    'overall_feedback',
-    'feedback',
-    'comments',
-    'notes',
-    'assessment',
-    'evaluation'
-  ];
+  const parts: string[] = [];
 
-  // Check top-level fieldEntries
-  if (submittedFormRender.fieldEntries) {
-    for (const entry of submittedFormRender.fieldEntries) {
-      if (!entry.field || typeof entry.field !== 'string') continue;
-      const fieldLower = entry.field.toLowerCase();
-      if (feedbackFieldNames.some(name => fieldLower.includes(name))) {
-        const value = entry.fieldValue?.value;
-        if (value && typeof value === 'string' && value.trim()) {
-          return value.trim();
-        }
+  function extractFromEntries(entries: any[]) {
+    for (const entry of entries) {
+      const value = entry.fieldValue?.value;
+      if (!value) continue;
+
+      // Skip numeric-only values (likely the overall recommendation score)
+      if (typeof value === 'number') continue;
+      if (typeof value === 'string' && /^\d+$/.test(value.trim())) continue;
+
+      if (typeof value === 'string' && value.trim()) {
+        parts.push(value.trim());
+      } else if (typeof value === 'object') {
+        // ProseMirror rich text JSON
+        const text = extractTextFromRichText(value);
+        if (text) parts.push(text);
       }
     }
   }
 
-  // Check sections
+  if (submittedFormRender.fieldEntries) {
+    extractFromEntries(submittedFormRender.fieldEntries);
+  }
+
   if (submittedFormRender.sections) {
     for (const section of submittedFormRender.sections) {
       if (section.fieldEntries) {
-        for (const entry of section.fieldEntries) {
-          if (!entry.field || typeof entry.field !== 'string') continue;
-          const fieldLower = entry.field.toLowerCase();
-          if (feedbackFieldNames.some(name => fieldLower.includes(name))) {
-            const value = entry.fieldValue?.value;
-            if (value && typeof value === 'string' && value.trim()) {
-              return value.trim();
-            }
-          }
-        }
+        extractFromEntries(section.fieldEntries);
       }
     }
   }
 
-  return null;
+  return parts.length > 0 ? parts.join(' | ') : null;
 }
 
 /**
