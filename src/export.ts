@@ -154,19 +154,30 @@ export async function exportCSV(data: AggregatedData, filePath = 'ashby-pipeline
         currentStageDate = dateStr;
       }
 
-      // Format previous interviews
+      // Format previous interviews with interviewer detail and feedback
       if (previousInterviews.length > 0) {
-        const previousParts = previousInterviews.map(event => {
-          const dateStr = new Date(event.startTime).toISOString().split('T')[0];
-          const scores = event.interviewers
-            .filter((i: any) => i.overallRecommendation)
-            .map((i: any) => i.overallRecommendation);
-          const avgScore = scores.length > 0
-            ? (scores.reduce((a: number, b: string) => a + parseFloat(b), 0) / scores.length).toFixed(1)
-            : 'N/A';
-          return `${dateStr}: ${event.interviewTitle} (${avgScore})`;
-        });
-        interviewHistorySummary = previousParts.join(' | ');
+        interviewHistorySummary = previousInterviews.flatMap(event => {
+          const eventDate = new Date(event.startTime);
+          const month = String(eventDate.getMonth() + 1).padStart(2, '0');
+          const day = String(eventDate.getDate()).padStart(2, '0');
+          const dateStr = `${month}/${day}`;
+          return event.interviewers.map((interviewer: any) => {
+            const score = interviewer.overallRecommendation
+              ? `Score: ${interviewer.overallRecommendation}`
+              : 'No score';
+            let feedbackSnippet = '';
+            if (cand.allFeedback && cand.allFeedback.length > 0) {
+              const matchingFeedback = cand.allFeedback.find(
+                (fb: any) => fb.interviewTitle === event.interviewTitle &&
+                      fb.interviewer === interviewer.name
+              );
+              if (matchingFeedback && matchingFeedback.feedbackText) {
+                feedbackSnippet = `: ${matchingFeedback.feedbackText}`;
+              }
+            }
+            return `${event.interviewTitle} (${dateStr}) - ${interviewer.name} - ${score}${feedbackSnippet}`;
+          });
+        }).join(' | ');
       }
     }
 

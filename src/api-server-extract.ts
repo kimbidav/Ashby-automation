@@ -197,15 +197,24 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
       }
 
       if (previousInterviews.length > 0) {
-        interviewHistorySummary = previousInterviews.map(event => {
-          const dateStr = new Date(event.startTime).toISOString().split('T')[0];
-          const scores = event.interviewers
-            .filter(i => i.overallRecommendation)
-            .map(i => String(i.overallRecommendation));
-          const avgScore = scores.length > 0
-            ? (scores.reduce((a, b) => a + parseFloat(b), 0) / scores.length).toFixed(1)
-            : 'N/A';
-          return `${dateStr}: ${event.interviewTitle} (${avgScore})`;
+        interviewHistorySummary = previousInterviews.flatMap(event => {
+          const d = new Date(event.startTime);
+          const dateStr = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+          return event.interviewers.map(interviewer => {
+            const score = interviewer.overallRecommendation
+              ? `Score: ${interviewer.overallRecommendation}`
+              : 'No score';
+            let feedbackSnippet = '';
+            if (cand.allFeedback && cand.allFeedback.length > 0) {
+              const match = cand.allFeedback.find(
+                fb => fb.interviewTitle === event.interviewTitle && fb.interviewer === interviewer.name
+              );
+              if (match?.feedbackText) {
+                feedbackSnippet = `: ${match.feedbackText}`;
+              }
+            }
+            return `${event.interviewTitle} (${dateStr}) - ${interviewer.name} - ${score}${feedbackSnippet}`;
+          });
         }).join(' | ');
       }
     }
