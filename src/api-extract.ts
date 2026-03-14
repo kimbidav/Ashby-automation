@@ -4,16 +4,16 @@
  * extractCommand() runs the full pipeline:
  *   1. Load session from .ashby-session.json
  *   2. Discover all accessible organizations (fetchAllAvailableOrgs)
- *   3. For each org: switch context and fetch jobs + candidates (fetchPipelineForOrg)
- *   4. Optionally enrich with interview details (enrichCandidatesWithDetails)
- *   5. Export to timestamped CSV and JSON in output/
+ *   3. For each org: switch context and fetch jobs + candidates with inline enrichment
+ *   4. Export to timestamped CSV and JSON in output/
+ *
+ * Interview events, scorecard feedback, and stage progress are fetched inline
+ * during the initial query — no separate enrichment phase.
  *
  * ExtractOptions:
- *   maxOrgs           — Limit orgs processed (useful for testing, e.g. --max-orgs 2)
- *   retries           — Retry count per org on failure
- *   detailed          — Fetch full interview feedback per candidate (slower, default: true)
- *   detailedConcurrent — Concurrent detail requests per org (default: 5)
- *   orgFilter         — Case-insensitive name filter to run on a single org
+ *   maxOrgs   — Limit orgs processed (useful for testing, e.g. --max-orgs 2)
+ *   retries   — Retry count per org on failure
+ *   orgFilter — Case-insensitive name filter to run on a single org
  */
 import { loadSession } from './session.js';
 import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';

@@ -6,19 +6,19 @@
  *
  * Key exports:
  *   fetchAllAvailableOrgs()        List every org the session user can access (via /api/auth/available_identities)
- *   fetchPipelineForOrg()          Fetch open jobs + all active applications for one org
- *   enrichCandidatesWithDetails()  Add interview events, feedback scores, and stage position to candidates
+ *   fetchPipelineForOrg()          Fetch open jobs + all active applications for one org (with inline enrichment)
+ *   createAuthHeaders()            Build cookie/CSRF headers for raw fetch calls
  *
  * Multi-org flow (runs once per org during extraction):
  *   1. GET /api/auth/available_identities  → list of { orgId, userId }
  *   2. POST /api/auth/change_user/{userId} → switches the session to that org's context
  *   3. GET /api/csrf/token                 → fresh CSRF token required after every org switch
- *   4. GraphQL queries run in the new org context
+ *   4. Combined InitialFetch query: jobs + first app page + session user in one request
+ *   5. Paginate remaining applications (cursor-based, 100/page)
  *
- * Detailed enrichment (--detailed flag):
- *   Loads query_ApiApplication.graphql and calls ApiApplication per candidate to retrieve
- *   interviewEvents, scorecardSubmissions, feedback text, and interview plan stage ordering.
- *   Candidates are grouped by org first to minimize the number of org context switches.
+ * Enrichment is inline — the applicationsByPrebuiltView query includes interviewEvents,
+ * scorecardSubmissions, feedback text, and interview plan stages. No separate per-candidate
+ * API calls are needed. Data is extracted during normalizePipelineData().
  */
 import fetch from 'cross-fetch';
 import { AshbySession, Candidate, Company, Job } from './types.js';

@@ -17,6 +17,9 @@ This project is a **read-only control plane** for Ashby that aggregates **in-pro
 - **Multi-Org Support**: Automatically discovers and aggregates data across all accessible organizations
 - **Single Session**: Authenticate once, access all orgs
 - **Structured Output**: CSV and JSON exports with timestamped filenames
+- **Inline Enrichment**: Interview events, scorecard feedback, and stage progress fetched in bulk — no per-candidate API calls
+- **API Server**: Express server with `POST /api/extract` for the [Lovable dashboard frontend](https://github.com/kimbidav/ashbypipeline)
+- **Google Calendar Sync**: Batch-add interview events to Google Calendar via OAuth
 - **Smart Detection**: Identifies candidates needing scheduling based on stage and inactivity
 
 ### Safety & Non-Goals
@@ -141,6 +144,54 @@ company_name,job_title,job_id,candidate_name,candidate_id,pipeline_stage,decisio
 - `current_stage_date`: Date of current stage interviews
 - `interview_history_summary`: Summary of previous interview stages with dates and scores
 
+## API Server (for Lovable Frontend)
+
+The project includes an Express API server that powers the [Lovable dashboard](https://github.com/kimbidav/ashbypipeline).
+
+```bash
+npm run server           # Start on port 3001
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/extract` | Accept `{ cookie: "..." }`, run extraction, return candidates as JSON |
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/google/auth` | Get Google OAuth URL |
+| `GET` | `/api/google/callback` | OAuth callback (exchanges code for tokens) |
+| `POST` | `/api/calendar/add` | Batch-add interview events to Google Calendar |
+
+### API Response Format
+
+`POST /api/extract` returns candidates with full interview detail:
+
+```json
+{
+  "success": true,
+  "candidates": [{
+    "candidate_name": "Sunny Rekhi",
+    "company_name": "Netic",
+    "pipeline_stage": "Follow-up Interview",
+    "stage_progress": "4/6",
+    "feedback_count": 2,
+    "latest_recommendation": "3",
+    "current_stage_interviews": "• Follow Up (03/18) - Melisa Tokmak - No score yet",
+    "current_stage_avg_score": null,
+    "interview_history_summary": "2026-03-11: Coding Interview (3.0) | 2026-02-23: Initial Team Screen (3.0)",
+    "interview_events": [{
+      "interview_title": "Coding Interview",
+      "start_time": "2026-03-11T20:00:00.000Z",
+      "interviewers": [{
+        "name": "Zi Gao",
+        "score": "3",
+        "feedback_text": "Good communicator, pretty fast | Clear thought process..."
+      }]
+    }]
+  }]
+}
+```
+
 ## Advanced Usage
 
 ### Reconnaissance Mode (Optional)
@@ -169,21 +220,25 @@ npm run start -- auth-cookie --cookie "your_new_cookie"
 ```
 Ashby Automation/
 ├── src/
-│   ├── cli.ts              # Entry point — CLI commands (auth, auth-cookie, recon, extract)
-│   ├── types.ts            # Shared TypeScript interfaces (Candidate, AshbySession, etc.)
-│   ├── session.ts          # Auth & session management (.ashby-session.json)
-│   ├── client.ts           # Ashby GraphQL API client — org switching, pipeline fetch with inline enrichment
-│   ├── api-extract.ts      # Orchestration for the extract command
-│   ├── export.ts           # CSV and JSON export
-│   ├── recon.ts            # Dev tool: captures live API traffic to ashby-recon-log.json
-│   └── recon-parser.ts     # Dev tool: reads the recon log to extract GraphQL queries
-├── query_ApiApplication.graphql  # Full GraphQL query for single-application detail (legacy fallback)
-├── output/                 # Generated reports (timestamped, gitignored)
-├── dist/                   # Compiled JavaScript (gitignored)
-├── run_ashby_extract.sh    # Convenience wrapper with session expiry detection
-├── .ashby-session.json     # Saved auth session (gitignored)
-├── package.json            # Node.js dependencies
-└── README.md               # This file
+│   ├── cli.ts                # Entry point — CLI commands (auth, auth-cookie, recon, extract)
+│   ├── types.ts              # Shared TypeScript interfaces (Candidate, AshbySession, etc.)
+│   ├── session.ts            # Auth & session management (.ashby-session.json)
+│   ├── client.ts             # Core: Ashby GraphQL client — org switching, pipeline fetch, inline enrichment
+│   ├── api-extract.ts        # CLI orchestration: loops orgs → fetchPipelineForOrg → export
+│   ├── api-server-extract.ts # Server orchestration: same logic, returns snake_case JSON for frontend
+│   ├── server.ts             # Express API server (:3001) — /api/extract, /api/health, Google Calendar
+│   ├── export.ts             # CSV and JSON file export with computed interview summaries
+│   ├── google-calendar.ts    # Google Calendar OAuth + batch event creation
+│   ├── recon.ts              # Dev tool: captures live API traffic to ashby-recon-log.json
+│   └── recon-parser.ts       # Dev tool: reads the recon log to extract GraphQL queries
+├── query_ApiApplication.graphql  # Legacy: full single-application GraphQL query (no longer called)
+├── output/                   # Generated reports (timestamped, gitignored)
+├── dist/                     # Compiled JavaScript (gitignored)
+├── run_ashby_extract.sh      # Convenience wrapper with session expiry detection
+├── .ashby-session.json       # Saved auth session (gitignored)
+├── CLAUDE.md                 # AI assistant documentation (architecture, data flow, pitfalls)
+├── package.json              # Node.js dependencies
+└── README.md                 # This file
 ```
 
 ## Output Schema
@@ -309,7 +364,6 @@ A candidate is flagged as needing scheduling (`needs_scheduling: true`) if:
 
 - Slack digest notifications
 - Automated staleness alerts
-- Google Sheets sync
 - Candidate redeployment suggestions
 - Velocity analytics
 
