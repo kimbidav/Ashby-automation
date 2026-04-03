@@ -18,6 +18,7 @@ This project is a **read-only control plane** for Ashby that aggregates **in-pro
 - **Single Session**: Authenticate once, access all orgs
 - **Structured Output**: CSV and JSON exports with timestamped filenames
 - **Inline Enrichment**: Interview events, scorecard feedback, and stage progress fetched in bulk — no per-candidate API calls
+- **Resilient Extraction**: Automatic retry with exponential backoff for transient Ashby server errors, plus fallback to simplified queries for orgs where the full enrichment query is too heavy
 - **API Server**: Express server with `POST /api/extract` for the [Lovable dashboard frontend](https://github.com/kimbidav/ashbypipeline)
 - **Google Calendar Sync**: Batch-add interview events to Google Calendar via OAuth
 - **Smart Detection**: Identifies candidates needing scheduling based on stage and inactivity
@@ -323,6 +324,12 @@ Structured data with normalized companies, jobs, and candidates including interv
 
 **Solution**: Check the console output for specific error messages
 
+### Some Organizations Missing Candidates
+
+**Cause**: Ashby's internal API returns `"Unidentified server error"` for orgs where the full enrichment query (with scorecard data) is too heavy. This is a server-side issue on Ashby's end, not an auth problem.
+
+**Behavior**: The extraction automatically retries failed queries up to 2 times, then falls back to a simplified query without scorecard data. Candidates from these orgs will appear but without feedback text/scores. Check console output for `⚠️  Full query failed ... retrying with simplified query` messages.
+
 ### TypeScript Build Errors
 
 ```bash
@@ -346,6 +353,12 @@ Uses `/api/auth/change_user/{userId}` to switch between organization contexts, a
 Uses a combined initial GraphQL query (`InitialFetch`) that fetches jobs, the first page of applications, and session user info in a single HTTP request. The applications query includes full interview events, scorecard feedback, and interview plan data inline — eliminating the need for a separate per-candidate enrichment phase.
 
 Subsequent application pages are fetched sequentially (cursor-based pagination) with the same expanded field set.
+
+### Error Recovery
+
+Ashby's internal API can return transient server errors for orgs with large datasets. The extraction handles this with:
+1. **Automatic retry** (up to 2 attempts with exponential backoff) for transient `"Unidentified server error"` responses
+2. **Fallback query** that strips scorecard/feedback fields if the full query keeps failing — candidates still appear with basic data, just without feedback text/scores
 
 ### Needs Scheduling Logic
 

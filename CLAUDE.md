@@ -33,8 +33,9 @@ server.ts (Express API)
       - All open jobs (`jobsPipelines`)
       - First page of active applications with full enrichment data
       - Session user info (org name)
-   d. Paginate remaining applications (cursor-based, 100 per page)
-   e. **Normalization** extracts enrichment data inline: interview events, scorecard feedback, stage progress
+   d. If the full query fails with a transient server error, **retry up to 2 times** with backoff, then **fall back to a simplified query** without scorecard data
+   e. Paginate remaining applications (cursor-based, 100 per page)
+   f. **Normalization** extracts enrichment data inline: interview events, scorecard feedback, stage progress
 4. **Export** to CSV + JSON
 
 ### Why Orgs Must Be Sequential
@@ -53,6 +54,18 @@ This data is extracted during `normalizePipelineData()` in `client.ts`. There is
 
 The old `enrichCandidatesWithDetails()` function still exists in `client.ts` but is no longer called from either orchestration path.
 
+### Error Recovery: Retry + Fallback
+
+Ashby's internal GraphQL API returns transient `"Unidentified server error"` for some orgs when the full enrichment query (with scorecard/feedback fields) is too heavy. This is a server-side issue on Ashby's end, not a session/auth problem. Orgs with lots of data (e.g., Decagon, January) are most likely to trigger it.
+
+**Two-layer defense in `client.ts`:**
+
+1. **`graphqlQuery()` retries** — transient server errors are retried up to 2 times with exponential backoff (1s, 2s). CSRF token is refreshed between retries. This catches intermittent failures.
+
+2. **`fetchPipelineForOrg()` fallback query** — if the full query fails even after retries, it re-tries with a simplified query that omits `scorecardSubmission` data (the heaviest nested field). The `useFallbackQuery` flag is also applied to pagination queries for that org. Candidates from fallback orgs will have interview events and interviewer names but no feedback text or scores.
+
+The fallback query still includes: candidate info, job/stage data, interview events with interviewer names/emails, credited-to, source, interview plan stages, and application status.
+
 ## Source Files
 
 | File | Purpose |
@@ -60,7 +73,7 @@ The old `enrichCandidatesWithDetails()` function still exists in `client.ts` but
 | `src/cli.ts` | CLI entry point. Commander.js commands: `auth`, `auth-cookie`, `recon`, `extract` |
 | `src/types.ts` | All shared interfaces: `Candidate`, `AshbySession`, `InterviewEvent`, `InterviewFeedback`, `Company`, `Job` |
 | `src/session.ts` | Session management. `loadSession()` tries `.ashby-session.json` first, falls back to Playwright browser context |
-| `src/client.ts` | **Core file (~1100 lines).** Org discovery, org switching, GraphQL queries, data normalization with inline enrichment |
+| `src/client.ts` | **Core file (~1400 lines).** Org discovery, org switching, GraphQL queries with retry/fallback, data normalization with inline enrichment |
 | `src/api-extract.ts` | CLI orchestration. Loops through orgs, calls `fetchPipelineForOrg()`, exports results |
 | `src/api-server-extract.ts` | Server orchestration. Same logic but returns in-memory data in snake_case format for frontend |
 | `src/export.ts` | CSV and JSON file writers. CSV includes computed interview summaries and score averages |
@@ -76,7 +89,7 @@ The old `enrichCandidatesWithDetails()` function still exists in `client.ts` but
 - `switchOrgContext(session, userId)` — switches server-side org context, refreshes CSRF token, verifies switch
 - `fetchPipelineForOrg(session, orgId, userId)` — the main function: combined initial query + pagination + normalization
 - `normalizePipelineData(jobs, applications, orgId, orgName)` — converts raw GraphQL data to `Candidate[]` with inline enrichment
-- `graphqlQuery<T>(session, operationName, query, variables, forceRefreshCsrf)` — low-level GraphQL executor
+- `graphqlQuery<T>(session, operationName, query, variables, forceRefreshCsrf, retries)` — low-level GraphQL executor with automatic retry for transient server errors
 - `extractFeedbackText(submittedFormRender)` — parses scorecard form data to extract feedback text
 - `enrichCandidatesWithDetails(session, candidates, orgInfos, options)` — **legacy**, no longer called
 
@@ -179,5 +192,15 @@ The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `
 - **Session invalidation**: The `switchOrgContext` function modifies `session.cookies` in-place (from `set-cookie` response headers). If the process crashes mid-extraction, the saved session file may have stale cookies.
 - **CSRF tokens**: Must be refreshed after every org switch. The token from before the switch is invalid for the new org context.
 - **`applicationsByPrebuiltView` fields**: This is an internal Ashby API. If Ashby changes the schema, the expanded query may fail. The fields we request (interviewEvents, interviewPlan, scorecardSubmission) are stable since they're used by the Ashby web UI itself.
+- **Transient server errors**: Ashby's API returns `"Unidentified server error"` for some orgs when the full enrichment query is too heavy. This is NOT a session/auth issue — it's server-side. The retry + fallback mechanism in `graphqlQuery()` and `fetchPipelineForOrg()` handles this automatically. Orgs with large datasets (many candidates/interviews) are most likely to trigger it.
 - **ESM modules**: Project uses `"type": "module"` with `ts-node/esm` loader. All imports use `.js` extensions even for `.ts` files.
 - **The `--detailed` / `--no-detailed` CLI flags**: These still exist in `cli.ts` but are currently no-ops since enrichment is always inline. They could be removed or repurposed.
+
+## Future Performance Optimizations
+
+Currently the extraction processes all ~60 orgs sequentially (~2 min total). Parallelization is blocked by Ashby's server-side session (one org context at a time per token). Planned improvements:
+
+- **Lazy enrichment**: Serve simple query results immediately, fetch scorecard/feedback on-demand per candidate via the existing `ApiApplication` query in `fetchApplicationDetails()`
+- **Skip empty orgs**: Check `jobsPipelines.applicationCount` first, skip orgs with 0 candidates (~20 orgs currently)
+- **Cache + incremental refresh**: Store last extraction, serve cached data instantly, only re-fetch orgs whose `applicationCount` changed
+- **Streaming responses**: Use SSE or chunked JSON to stream results per-org as they complete
