@@ -245,7 +245,8 @@ async function graphqlQuery<T>(
   operationName: string,
   query: string,
   variables: Record<string, unknown> = {},
-  forceRefreshCsrf = false
+  forceRefreshCsrf = false,
+  retries = 2
 ): Promise<T> {
   // Ensure we have a CSRF token - refresh if forced or missing
   let csrfToken = session.csrfToken;
@@ -260,44 +261,65 @@ async function graphqlQuery<T>(
   }
 
   const url = `https://app.ashbyhq.com/api/graphql?op=${operationName}`;
-  const headers = createAuthHeaders(session);
-  headers['content-type'] = 'application/json';
-  if (csrfToken) {
-    headers['x-csrf-token'] = csrfToken;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const headers = createAuthHeaders(session);
+    headers['content-type'] = 'application/json';
+    if (session.csrfToken) {
+      headers['x-csrf-token'] = session.csrfToken;
+    }
+
+    const body = JSON.stringify({
+      operationName,
+      query,
+      variables
+    });
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body
+    });
+
+    if (!res.ok) {
+      throw new Error(`GraphQL request failed ${res.status} ${res.statusText}`);
+    }
+
+    const responseText = await res.text();
+    let response: GraphQLResponse<T>;
+    try {
+      response = JSON.parse(responseText) as GraphQLResponse<T>;
+    } catch (e) {
+      console.error(`Failed to parse GraphQL response for ${operationName}:`, responseText.substring(0, 500));
+      throw new Error(`Invalid JSON response: ${responseText.substring(0, 200)}`);
+    }
+
+    if (response.errors) {
+      const errorMessages = response.errors.map(e => e.message).join(', ');
+      const isTransient = response.errors.some(e =>
+        e.message.includes('Unidentified server error') ||
+        e.message.includes('looking into it')
+      );
+
+      if (isTransient && attempt < retries) {
+        const delay = 1000 * (attempt + 1);
+        console.warn(`  ⚠️  Transient error for ${operationName}, retrying in ${delay}ms (attempt ${attempt + 1}/${retries})...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        // Refresh CSRF token before retry in case it went stale
+        try {
+          session.csrfToken = await fetchCsrfToken(session);
+        } catch { /* ignore, will try with existing token */ }
+        continue;
+      }
+
+      console.error(`GraphQL errors for ${operationName}:`, errorMessages);
+      throw new Error(`GraphQL errors: ${errorMessages}`);
+    }
+
+    return response.data;
   }
 
-  const body = JSON.stringify({
-    operationName,
-    query,
-    variables
-  });
-
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body
-  });
-
-  if (!res.ok) {
-    throw new Error(`GraphQL request failed ${res.status} ${res.statusText}`);
-  }
-
-  const responseText = await res.text();
-  let response: GraphQLResponse<T>;
-  try {
-    response = JSON.parse(responseText) as GraphQLResponse<T>;
-  } catch (e) {
-    console.error(`Failed to parse GraphQL response for ${operationName}:`, responseText.substring(0, 500));
-    throw new Error(`Invalid JSON response: ${responseText.substring(0, 200)}`);
-  }
-
-  if (response.errors) {
-    const errorMessages = response.errors.map(e => e.message).join(', ');
-    console.error(`GraphQL errors for ${operationName}:`, errorMessages);
-    throw new Error(`GraphQL errors: ${errorMessages}`);
-  }
-
-  return response.data;
+  throw new Error('Unreachable code in graphqlQuery');
 }
 
 export interface OrgInfo {
@@ -710,23 +732,132 @@ ${applicationFieldsFragment}
   let hasMore = true;
   let orgName: string | undefined;
 
+  // Fallback query with minimal fields (no scorecard/interview enrichment)
+  // Used when the full query triggers server errors for certain orgs
+  const fallbackApplicationFields = `
+          id
+          job {
+            id
+            title
+            interviewPlansWithActivities {
+              id
+              isDefault
+              interviewPlan {
+                ... on CustomInterviewPlan {
+                  id
+                  interviewStages { id title stageType __typename }
+                  __typename
+                }
+                ... on InterviewPlanTemplate {
+                  id
+                  interviewStages { id title stageType __typename }
+                  __typename
+                }
+                __typename
+              }
+              __typename
+            }
+            __typename
+          }
+          candidate {
+            id
+            name
+            company
+            socialLinks {
+              type
+              url
+              __typename
+            }
+            pseudonym {
+              pseudonym
+              __typename
+            }
+            isBlinded
+            __typename
+          }
+          source {
+            id
+            title
+            __typename
+          }
+          creditedToUser {
+            id
+            firstName
+            lastName
+            email
+            __typename
+          }
+          applicationStatus {
+            description
+            priority
+            dueAt
+            __typename
+          }
+          createdAt
+          currentInterviewStage {
+            id
+            title
+            interviewPlanId
+            stageType
+            __typename
+          }
+          interviewPlan {
+            id
+            interviewStages {
+              id
+              title
+              stageType
+              __typename
+            }
+            __typename
+          }
+          interviewEvents {
+            id
+            startTime
+            endTime
+            interview {
+              id
+              title
+              __typename
+            }
+            interviewerEvents {
+              id
+              interviewer {
+                id
+                firstName
+                lastName
+                email
+                __typename
+              }
+              isFeedbackSubmitted
+              __typename
+            }
+            __typename
+          }
+          extraFields
+          __typename`;
+
+  let useFallbackQuery = false;
+
   // Fetch initial combined data (jobs + first app page + session user)
+  const initialVars = {
+    onlyIncludeOpenJobs: true,
+    onlyIncludeJobsUserFollowsOrHasRole: false,
+    customFilter: null,
+    extraFields: [],
+    orderByFields: [{ field: 'submitted_at', ascending: false }],
+    cursor: null,
+    searchTerm: '',
+    queryContext: null,
+    limit: 100
+  };
+
   try {
     const initialData = await graphqlQuery<InitialFetchResponse>(
       session,
       'InitialFetch',
       initialQuery,
-      {
-        onlyIncludeOpenJobs: true,
-        onlyIncludeJobsUserFollowsOrHasRole: false,
-        customFilter: null,
-        extraFields: [],
-        orderByFields: [{ field: 'submitted_at', ascending: false }],
-        cursor: null,
-        searchTerm: '',
-        queryContext: null,
-        limit: 100
-      },
+      initialVars,
       switchedOrg
     );
 
@@ -741,13 +872,99 @@ ${applicationFieldsFragment}
     if (initialData.user.organizationId === orgId) {
       orgName = initialData.user.organizationName;
     }
-  } catch (error) {
-    console.error('Error in initial combined fetch:', error);
-    throw error;
+  } catch (error: any) {
+    // If the full query fails (even after retries in graphqlQuery), try a fallback
+    // with stripped-down fields (no scorecard data which can cause server errors)
+    const isServerError = error?.message?.includes('Unidentified server error') ||
+                          error?.message?.includes('looking into it');
+    if (isServerError) {
+      console.warn(`  ⚠️  Full query failed for org ${orgId}, retrying with simplified query (no scorecard data)...`);
+      useFallbackQuery = true;
+
+      const fallbackInitialQuery = `
+        query InitialFetch(
+          $onlyIncludeOpenJobs: Boolean = true,
+          $onlyIncludeJobsUserFollowsOrHasRole: Boolean = false,
+          $customFilter: JSON,
+          $extraFields: [String],
+          $orderByFields: [OrderByFieldInput],
+          $cursor: String,
+          $searchTerm: String,
+          $queryContext: JSON,
+          $limit: Int
+        ) {
+          jobsPipelines(
+            onlyIncludeOpenJobs: $onlyIncludeOpenJobs
+            onlyIncludeJobsUserFollowsOrHasRole: $onlyIncludeJobsUserFollowsOrHasRole
+          ) {
+            jobId
+            jobTitle
+            jobLocationName
+            customRequisitionId
+            confidential
+            userFollowsOrHasRole
+            applicationCount
+            __typename
+          }
+          result: applicationsByPrebuiltView(
+            prebuiltView: Active
+            customFilter: $customFilter
+            extraFields: $extraFields
+            orderByFields: $orderByFields
+            cursor: $cursor
+            searchTerm: $searchTerm
+            queryContext: $queryContext
+            limit: $limit
+          ) {
+            results {
+      ${fallbackApplicationFields}
+            }
+            nextCursor
+            moreDataAvailable
+            opaqueFilter
+            __typename
+          }
+          user: sessionUserV2 {
+            organizationId
+            organizationName
+            __typename
+          }
+        }
+      `;
+
+      try {
+        const fallbackData = await graphqlQuery<InitialFetchResponse>(
+          session,
+          'InitialFetch',
+          fallbackInitialQuery,
+          initialVars,
+          true // force CSRF refresh
+        );
+
+        jobsData = { jobsPipelines: fallbackData.jobsPipelines };
+        console.log(`  Found ${jobsData.jobsPipelines.length} open jobs (fallback)`);
+
+        allApplications.push(...fallbackData.result.results);
+        cursor = fallbackData.result.nextCursor;
+        hasMore = fallbackData.result.moreDataAvailable;
+        console.log(`  Fetched ${fallbackData.result.results.length} applications (fallback, total: ${allApplications.length}, more: ${hasMore})`);
+
+        if (fallbackData.user.organizationId === orgId) {
+          orgName = fallbackData.user.organizationName;
+        }
+      } catch (fallbackError) {
+        console.error('  Error in fallback fetch:', fallbackError);
+        throw fallbackError;
+      }
+    } else {
+      console.error('Error in initial combined fetch:', error);
+      throw error;
+    }
   }
 
   // Fetch remaining pages of applications (cursor-dependent, must be sequential)
   if (hasMore) {
+    const activeFields = useFallbackQuery ? fallbackApplicationFields : applicationFieldsFragment;
     const paginationQuery = `
       query ApiGetActiveApplications($customFilter: JSON, $extraFields: [String], $orderByFields: [OrderByFieldInput], $cursor: String, $searchTerm: String, $queryContext: JSON, $limit: Int) {
         result: applicationsByPrebuiltView(
@@ -761,7 +978,7 @@ ${applicationFieldsFragment}
           limit: $limit
         ) {
           results {
-${applicationFieldsFragment}
+${activeFields}
           }
           nextCursor
           moreDataAvailable
