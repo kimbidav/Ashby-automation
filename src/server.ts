@@ -23,7 +23,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-app.post('/api/extract', async (req, res) => {
+const handleExtract = async (req: express.Request, res: express.Response) => {
   const { cookie } = req.body;
 
   if (!cookie || typeof cookie !== 'string' || !cookie.trim()) {
@@ -70,7 +70,10 @@ app.post('/api/extract', async (req, res) => {
     console.error('Extraction error:', message);
     res.status(500).json({ error: 'Extraction failed.', detail: message });
   }
-});
+};
+
+app.post('/api/extract', handleExtract);
+app.post('/api/extract/start', handleExtract);
 
 // --- Google Calendar OAuth (multi-user) ---
 // Tokens are returned to the frontend and stored in localStorage.
