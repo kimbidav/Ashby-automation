@@ -52,6 +52,7 @@ app.post('/api/extract', async (req, res) => {
         jobs: data.jobs.length,
         candidates: data.candidates.length,
       },
+      companies: data.companies,
       candidates: data.candidates,
     });
   } catch (err: any) {
