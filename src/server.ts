@@ -2,15 +2,15 @@
  * server.ts -- Express API server for self-serve Ashby pipeline extraction.
  *
  * Endpoints:
- *   POST /api/extract   Accept a cookie string, run extraction, return candidate data as JSON
- *   GET  /api/health    Health check
- *
- * The extraction logic reuses the same code as the CLI `extract` command,
- * but returns JSON directly instead of writing files.
+ *   POST /api/extract         Synchronous extraction (waits ~2 min, returns result)
+ *   POST /api/extract/start   Async extraction: returns jobId immediately, poll /status
+ *   GET  /api/extract/status/:jobId   Poll for job completion
+ *   GET  /api/health          Health check
  */
 import express from 'express';
 import cors from 'cors';
-import { createSessionFromCookie, extractPipeline } from './api-server-extract.js';
+import crypto from 'crypto';
+import { createSessionFromCookie, extractPipeline, ExtractResult } from './api-server-extract.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
@@ -19,71 +19,194 @@ const PORT = parseInt(process.env.PORT || '3001', 10);
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+// ── In-memory job store for async extraction ──────────────────────────────
+
+interface ExtractionJob {
+  id: string;
+  status: 'running' | 'completed' | 'failed';
+  created_at: string;
+  completed_at?: string;
+  result?: {
+    success: true;
+    extracted_at: string;
+    stats: { companies: number; jobs: number; candidates: number };
+    companies: any[];
+    candidates: any[];
+  };
+  error?: string;
+  detail?: string;
+}
+
+const jobs = new Map<string, ExtractionJob>();
+
+// Clean up jobs older than 30 minutes
+function cleanupOldJobs() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (new Date(job.created_at).getTime() < cutoff) {
+      jobs.delete(id);
+    }
+  }
+}
+
+// ── Health check ──────────────────────────────────────────────────────────
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-const handleExtract = async (req: express.Request, res: express.Response) => {
-  const { cookie } = req.body;
+// ── Cookie validation helper ──────────────────────────────────────────────
 
+function validateCookie(cookie: unknown): { session: ReturnType<typeof createSessionFromCookie> } | { error: string; status: number } {
   if (!cookie || typeof cookie !== 'string' || !cookie.trim()) {
-    res.status(400).json({ error: 'Missing or empty "cookie" field in request body.' });
+    return { error: 'Missing or empty "cookie" field in request body.', status: 400 };
+  }
+
+  const session = createSessionFromCookie(cookie.trim());
+
+  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+    return {
+      error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
+      status: 400,
+    };
+  }
+
+  return { session };
+}
+
+function formatResult(data: ExtractResult) {
+  return {
+    success: true as const,
+    extracted_at: new Date().toISOString(),
+    stats: {
+      companies: data.companies.length,
+      jobs: data.jobs.length,
+      candidates: data.candidates.length,
+    },
+    companies: data.companies,
+    candidates: data.candidates,
+  };
+}
+
+function handleExtractionError(err: any, res: express.Response) {
+  const message = err?.message || String(err);
+
+  if (message.includes('401') || message.includes('expired') || message.includes('CSRF')) {
+    res.status(401).json({
+      error: 'Session expired or invalid. Please paste a fresh cookie from Ashby.',
+      detail: message,
+    });
+    return;
+  }
+
+  console.error('Extraction error:', message);
+  res.status(500).json({ error: 'Extraction failed.', detail: message });
+}
+
+// ── Synchronous extraction (original endpoint) ───────────────────────────
+
+app.post('/api/extract', async (req: express.Request, res: express.Response) => {
+  const validation = validateCookie(req.body.cookie);
+  if ('error' in validation) {
+    res.status(validation.status).json({ error: validation.error });
     return;
   }
 
   try {
-    const session = createSessionFromCookie(cookie.trim());
-
-    // Validate that the cookie has the required auth token
-    if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
-      res.status(400).json({
-        error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.'
-      });
-      return;
-    }
-
-    const data = await extractPipeline(session);
-
-    res.json({
-      success: true,
-      extracted_at: new Date().toISOString(),
-      stats: {
-        companies: data.companies.length,
-        jobs: data.jobs.length,
-        candidates: data.candidates.length,
-      },
-      companies: data.companies,
-      candidates: data.candidates,
-    });
+    const data = await extractPipeline(validation.session);
+    res.json(formatResult(data));
   } catch (err: any) {
-    const message = err?.message || String(err);
-
-    // Detect auth failures
-    if (message.includes('401') || message.includes('expired') || message.includes('CSRF')) {
-      res.status(401).json({
-        error: 'Session expired or invalid. Please paste a fresh cookie from Ashby.',
-        detail: message,
-      });
-      return;
-    }
-
-    console.error('Extraction error:', message);
-    res.status(500).json({ error: 'Extraction failed.', detail: message });
+    handleExtractionError(err, res);
   }
-};
+});
 
-app.post('/api/extract', handleExtract);
-app.post('/api/extract/start', handleExtract);
+// ── Async extraction (start + poll) ──────────────────────────────────────
+
+app.post('/api/extract/start', (req: express.Request, res: express.Response) => {
+  const validation = validateCookie(req.body.cookie);
+  if ('error' in validation) {
+    res.status(validation.status).json({ error: validation.error });
+    return;
+  }
+
+  cleanupOldJobs();
+
+  const jobId = crypto.randomUUID();
+  const job: ExtractionJob = {
+    id: jobId,
+    status: 'running',
+    created_at: new Date().toISOString(),
+  };
+  jobs.set(jobId, job);
+
+  // Fire and forget — extraction runs in the background
+  extractPipeline(validation.session)
+    .then((data) => {
+      job.status = 'completed';
+      job.completed_at = new Date().toISOString();
+      job.result = formatResult(data);
+    })
+    .catch((err: any) => {
+      const message = err?.message || String(err);
+      job.status = 'failed';
+      job.completed_at = new Date().toISOString();
+      if (message.includes('401') || message.includes('expired') || message.includes('CSRF')) {
+        job.error = 'Session expired or invalid. Please paste a fresh cookie from Ashby.';
+      } else {
+        job.error = 'Extraction failed.';
+      }
+      job.detail = message;
+      console.error(`Job ${jobId} failed:`, message);
+    });
+
+  // Return immediately with the job ID
+  res.json({ jobId, status: 'running' });
+});
+
+app.get('/api/extract/status/:jobId', (req: express.Request, res: express.Response) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    res.status(404).json({ error: 'Job not found. It may have expired (30-min TTL).' });
+    return;
+  }
+
+  if (job.status === 'running') {
+    res.json({ jobId: job.id, status: 'running', created_at: job.created_at });
+    return;
+  }
+
+  if (job.status === 'failed') {
+    res.status(job.error?.includes('expired') ? 401 : 500).json({
+      jobId: job.id,
+      status: 'failed',
+      error: job.error,
+      detail: job.detail,
+    });
+    // Clean up failed jobs after first read
+    jobs.delete(job.id);
+    return;
+  }
+
+  // completed
+  res.json({
+    jobId: job.id,
+    status: 'completed',
+    ...job.result,
+  });
+  // Clean up completed jobs after first read
+  jobs.delete(job.id);
+});
 
 // --- Google Calendar OAuth (multi-user) ---
 // Tokens are returned to the frontend and stored in localStorage.
 // The frontend sends tokens with each calendar request.
 
-app.get('/api/google/auth', (_req, res) => {
+app.get('/api/google/auth', (_req: express.Request, res: express.Response) => {
   res.json({ url: getAuthUrl() });
 });
 
-app.get('/api/google/callback', async (req, res) => {
+app.get('/api/google/callback', async (req: express.Request, res: express.Response) => {
   const code = req.query.code as string;
   if (!code) {
     res.status(400).json({ error: 'Missing code parameter.' });
@@ -107,7 +230,7 @@ app.get('/api/google/callback', async (req, res) => {
 // --- Calendar batch add (multi-user) ---
 // Frontend sends google_tokens alongside events.
 
-app.post('/api/calendar/add', async (req, res) => {
+app.post('/api/calendar/add', async (req: express.Request, res: express.Response) => {
   const { events, google_tokens } = req.body as {
     events?: CalendarEventRequest[];
     google_tokens?: any;
