@@ -164,7 +164,8 @@ app.post('/api/extract/start', (req: express.Request, res: express.Response) => 
 });
 
 app.get('/api/extract/status/:jobId', (req: express.Request, res: express.Response) => {
-  const job = jobs.get(req.params.jobId);
+  const jobId = req.params.jobId as string;
+  const job = jobs.get(jobId);
 
   if (!job) {
     res.status(404).json({ error: 'Job not found. It may have expired (30-min TTL).' });
