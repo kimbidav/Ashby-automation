@@ -159,11 +159,11 @@ app.post('/api/extract/start', (req: express.Request, res: express.Response) => 
       console.error(`Job ${jobId} failed:`, message);
     });
 
-  // Return immediately with the job ID
-  res.json({ jobId, status: 'running' });
+  // Return immediately with the job ID (both camelCase and snake_case for frontend compat)
+  res.json({ jobId, job_id: jobId, id: jobId, status: 'running' });
 });
 
-app.get('/api/extract/status/:jobId', (req: express.Request, res: express.Response) => {
+const handleJobStatus = (req: express.Request, res: express.Response) => {
   const jobId = req.params.jobId as string;
   const job = jobs.get(jobId);
 
@@ -197,7 +197,10 @@ app.get('/api/extract/status/:jobId', (req: express.Request, res: express.Respon
   });
   // Clean up completed jobs after first read
   jobs.delete(job.id);
-});
+};
+
+app.get('/api/extract/status/:jobId', handleJobStatus);
+app.get('/api/extract/jobs/:jobId', handleJobStatus);
 
 // --- Google Calendar OAuth (multi-user) ---
 // Tokens are returned to the frontend and stored in localStorage.
