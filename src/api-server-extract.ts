@@ -98,25 +98,42 @@ export async function extractPipeline(
   session: AshbySession,
   onProgress?: ProgressCallback,
 ): Promise<ExtractResult> {
+  const startTime = Date.now();
+  const TIME_LIMIT_MS = 100_000; // 100 seconds — well within cookie lifespan
+
+  function timeRemaining(): number {
+    return TIME_LIMIT_MS - (Date.now() - startTime);
+  }
+
   // Discover orgs
   const orgInfos = await fetchAllAvailableOrgs(session);
   if (orgInfos.length === 0) {
     throw new Error('No organizations found. Check your session cookie.');
   }
 
-  console.log(`Found ${orgInfos.length} org(s)`);
+  console.log(`Found ${orgInfos.length} org(s). Time limit: ${TIME_LIMIT_MS / 1000}s`);
   onProgress?.(0, orgInfos.length, 'Discovering organizations...');
 
   const allCompanies: Company[] = [];
   const allJobs: Job[] = [];
   let allCandidates: Candidate[] = [];
+  let orgsProcessed = 0;
+  let orgsSkippedTimeout = 0;
 
   for (let i = 0; i < orgInfos.length; i++) {
     const orgInfo = orgInfos[i];
-    console.log(`[${i + 1}/${orgInfos.length}] Processing: ${orgInfo.name}`);
-    onProgress?.(i, orgInfos.length, orgInfo.name);
 
     if (!orgInfo.userId) continue;
+
+    // Check time limit — return partial results if we're running out
+    if (timeRemaining() < 5000 && allCandidates.length > 0) {
+      orgsSkippedTimeout = orgInfos.length - i;
+      console.log(`⏱️  Time limit reached after ${orgsProcessed} orgs (${allCandidates.length} candidates). Skipping ${orgsSkippedTimeout} remaining orgs.`);
+      break;
+    }
+
+    console.log(`[${i + 1}/${orgInfos.length}] Processing: ${orgInfo.name} (${Math.round(timeRemaining() / 1000)}s remaining)`);
+    onProgress?.(i, orgInfos.length, orgInfo.name);
 
     try {
       const { companies, jobs, candidates } = await fetchPipelineForOrg(
@@ -127,14 +144,27 @@ export async function extractPipeline(
       allCompanies.push(...companies);
       allJobs.push(...jobs);
       allCandidates.push(...candidates);
-      console.log(`  Found ${candidates.length} candidates`);
+      orgsProcessed++;
+      if (candidates.length > 0) {
+        console.log(`  Found ${candidates.length} candidates (total: ${allCandidates.length})`);
+      }
     } catch (err: any) {
-      console.error(`  Failed: ${err?.message?.substring(0, 150)}`);
+      const msg = err?.message?.substring(0, 150) || '';
+      console.error(`  Failed: ${msg}`);
+      // If we hit auth errors, stop immediately — cookie is dead
+      if (msg.includes('401') || msg.includes('expired') || msg.includes('CSRF')) {
+        if (allCandidates.length > 0) {
+          console.log(`⚠️  Auth error after ${orgsProcessed} orgs — returning ${allCandidates.length} candidates collected so far`);
+          break;
+        }
+        throw err; // No data collected yet — propagate the error
+      }
     }
-
   }
 
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
   onProgress?.(orgInfos.length, orgInfos.length, 'Finalizing...');
+  console.log(`Extraction complete: ${allCandidates.length} candidates from ${orgsProcessed} orgs in ${elapsed}s${orgsSkippedTimeout > 0 ? ` (${orgsSkippedTimeout} orgs skipped — time limit)` : ''}`);
 
   if (allCandidates.length === 0) {
     throw new Error('No candidates extracted from any organization. Session may be expired.');
