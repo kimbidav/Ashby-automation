@@ -368,32 +368,25 @@ export async function fetchAvailableOrgs(session: AshbySession): Promise<OrgInfo
 }
 
 async function switchOrgContext(session: AshbySession, userId: string): Promise<void> {
-  // Switch org context using the change_user endpoint
   const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
-  
-  // Always fetch a fresh CSRF token before switching
-  const csrfToken = await fetchCsrfToken(session);
+
+  // Use existing CSRF for the switch POST — no need to fetch a fresh one
   const headers = createAuthHeaders(session);
-  headers['x-csrf-token'] = csrfToken;
+  if (session.csrfToken) {
+    headers['x-csrf-token'] = session.csrfToken;
+  }
   headers['content-type'] = 'application/json';
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers
-  });
+  const res = await fetch(url, { method: 'POST', headers });
 
   if (!res.ok) {
     const errorText = await res.text();
     throw new Error(`Failed to switch org context: ${res.status} ${res.statusText}. Response: ${errorText.substring(0, 200)}`);
   }
 
-  // Wait a moment for the switch to complete
-  await new Promise(resolve => setTimeout(resolve, 500));
-
   // Update cookies from response headers (if any)
   const setCookieHeaders = res.headers.get('set-cookie');
   if (setCookieHeaders) {
-    // Parse and update session cookies
     const cookies = setCookieHeaders.split(',').map(c => c.trim());
     for (const cookie of cookies) {
       const [nameValue] = cookie.split(';');
@@ -404,42 +397,8 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
     }
   }
 
-  // Always fetch a fresh CSRF token after switching (critical!)
-  // The old token is invalid for the new org context
-  try {
-    const newCsrfToken = await fetchCsrfToken(session);
-    session.csrfToken = newCsrfToken;
-    console.log(`  ✓ Switched org context, refreshed CSRF token`);
-  } catch (error) {
-    console.warn(`  ⚠️  Could not fetch new CSRF token after org switch: ${error}`);
-    // Clear the old token so next query will fetch a new one
-    session.csrfToken = undefined;
-    throw new Error(`Failed to refresh CSRF token after org switch. Session may be invalid.`);
-  }
-
-  // Verify the switch worked by checking the session user
-  try {
-    const sessionUserQuery = `
-      query ApiGetSessionUser {
-        user: sessionUserV2 {
-          organizationId
-          organizationName
-          __typename
-        }
-      }
-    `;
-    const userResponse = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
-      session,
-      'ApiGetSessionUser',
-      sessionUserQuery,
-      {},
-      false // Don't force refresh, we just got a fresh token
-    );
-    console.log(`  ✓ Verified switch to org: ${userResponse.user.organizationName || userResponse.user.organizationId}`);
-  } catch (error) {
-    console.warn(`  ⚠️  Could not verify org switch: ${error}`);
-    // Continue anyway - the next query will reveal if it worked
-  }
+  // Refresh CSRF token for the new org context
+  session.csrfToken = await fetchCsrfToken(session);
 }
 
 interface AvailableIdentityResponse {
