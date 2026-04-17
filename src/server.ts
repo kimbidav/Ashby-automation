@@ -141,8 +141,9 @@ function handleExtractionError(err: any, res: express.Response) {
 // ── Synchronous extraction ───────────────────────────────────────────────
 
 app.post('/api/extract', async (req: express.Request, res: express.Response) => {
-  // Return cache if fresh
-  const cached = getCachedResult();
+  const force = req.body.force === true;
+  // Return cache if fresh (unless force=true)
+  const cached = !force ? getCachedResult() : null;
   if (cached) {
     console.log('Returning cached extraction result');
     res.json({ ...cached, cached: true });
@@ -168,8 +169,9 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
 // ── Async extraction (start + poll) ──────────────────────────────────────
 
 app.post('/api/extract/start', (req: express.Request, res: express.Response) => {
+  const force = req.body.force === true;
   // Return cache if fresh — no need to even validate the cookie
-  const cached = getCachedResult();
+  const cached = !force ? getCachedResult() : null;
   if (cached) {
     console.log('Returning cached extraction result (async fast path)');
     const jobId = crypto.randomUUID();
