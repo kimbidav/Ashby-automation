@@ -92,7 +92,12 @@ export function createSessionFromCookie(cookieHeader: string): AshbySession {
 /**
  * Run the full extraction pipeline and return structured data.
  */
-export async function extractPipeline(session: AshbySession): Promise<ExtractResult> {
+export type ProgressCallback = (completed: number, total: number, currentOrg: string) => void;
+
+export async function extractPipeline(
+  session: AshbySession,
+  onProgress?: ProgressCallback,
+): Promise<ExtractResult> {
   // Discover orgs
   const orgInfos = await fetchAllAvailableOrgs(session);
   if (orgInfos.length === 0) {
@@ -100,6 +105,7 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
   }
 
   console.log(`Found ${orgInfos.length} org(s)`);
+  onProgress?.(0, orgInfos.length, 'Discovering organizations...');
 
   const allCompanies: Company[] = [];
   const allJobs: Job[] = [];
@@ -108,6 +114,7 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
   for (let i = 0; i < orgInfos.length; i++) {
     const orgInfo = orgInfos[i];
     console.log(`[${i + 1}/${orgInfos.length}] Processing: ${orgInfo.name}`);
+    onProgress?.(i, orgInfos.length, orgInfo.name);
 
     if (!orgInfo.userId) continue;
 
@@ -126,6 +133,8 @@ export async function extractPipeline(session: AshbySession): Promise<ExtractRes
     }
 
   }
+
+  onProgress?.(orgInfos.length, orgInfos.length, 'Finalizing...');
 
   if (allCandidates.length === 0) {
     throw new Error('No candidates extracted from any organization. Session may be expired.');
