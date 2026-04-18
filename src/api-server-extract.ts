@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, quickCheckOrgHasCandidates } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -137,64 +137,22 @@ export async function extractPipeline(
   }
 
   const orgsWithUserId = orgInfos.filter(o => o.userId);
-  console.log(`Found ${orgInfos.length} org(s) (${orgsWithUserId.length} with userId)`);
-
-  // ── Pass 1: Fast scan to find which orgs have active candidates ────────
-  // ~200ms/org (no CSRF refresh, minimal query). Identifies the ~30 orgs
-  // that actually have candidates out of ~333 total.
-
-  onProgress?.(0, orgsWithUserId.length, 'Scanning orgs for active candidates...');
-  const orgsWithCandidates: typeof orgsWithUserId = [];
-  let scanErrors = 0;
-
-  for (let i = 0; i < orgsWithUserId.length; i++) {
-    const orgInfo = orgsWithUserId[i];
-
-    if (i % 20 === 0) {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`  Scan progress: ${i}/${orgsWithUserId.length} (${orgsWithCandidates.length} with candidates, ${elapsed}s)`);
-      onProgress?.(i, orgsWithUserId.length, `Scanning: ${orgInfo.name} (${orgsWithCandidates.length} found)`);
-    }
-
-    try {
-      const hasCandidates = await quickCheckOrgHasCandidates(session, orgInfo.userId);
-      if (hasCandidates) {
-        orgsWithCandidates.push(orgInfo);
-      }
-    } catch (err: any) {
-      const msg = err?.message || '';
-      if (msg.includes('401') || msg.includes('expired')) {
-        console.error(`  Cookie expired during scan at org ${i}/${orgsWithUserId.length}`);
-        // If we already found some orgs, continue to pass 2 with what we have
-        if (orgsWithCandidates.length > 0) break;
-        throw err;
-      }
-      scanErrors++;
-    }
-  }
-
-  const scanElapsed = Math.round((Date.now() - startTime) / 1000);
-  console.log(`Scan complete in ${scanElapsed}s: ${orgsWithCandidates.length} orgs have active candidates (of ${orgsWithUserId.length} scanned, ${scanErrors} errors)`);
-
-  if (orgsWithCandidates.length === 0) {
-    throw new Error('No organizations with active candidates found. Session may be expired.');
-  }
-
-  // ── Pass 2: Full fetch only for orgs with candidates ───────────────────
-  // ~1.5s/org but only ~30 orgs instead of ~333.
-
-  onProgress?.(0, orgsWithCandidates.length, 'Fetching candidate data...');
+  console.log(`Found ${orgInfos.length} org(s) (${orgsWithUserId.length} with userId). No CSRF refresh per org — lazy retry on 403.`);
+  onProgress?.(0, orgsWithUserId.length, 'Starting extraction...');
 
   const allCompanies: Company[] = [];
   const allJobs: Job[] = [];
   let allCandidates: Candidate[] = [];
   let orgsFetched = 0;
 
-  for (let i = 0; i < orgsWithCandidates.length; i++) {
-    const orgInfo = orgsWithCandidates[i];
+  for (let i = 0; i < orgsWithUserId.length; i++) {
+    const orgInfo = orgsWithUserId[i];
 
-    console.log(`[${i + 1}/${orgsWithCandidates.length}] Fetching: ${orgInfo.name}`);
-    onProgress?.(i, orgsWithCandidates.length, `Fetching: ${orgInfo.name}`);
+    if (i % 20 === 0 || i === orgsWithUserId.length - 1) {
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      console.log(`  Progress: ${i}/${orgsWithUserId.length} orgs, ${allCandidates.length} candidates, ${elapsed}s`);
+    }
+    onProgress?.(i, orgsWithUserId.length, orgInfo.name);
 
     try {
       const { companies, jobs, candidates } = await fetchPipelineForOrg(
@@ -206,13 +164,10 @@ export async function extractPipeline(
       allJobs.push(...jobs);
       allCandidates.push(...candidates);
       orgsFetched++;
-      if (candidates.length > 0) {
-        console.log(`  Found ${candidates.length} candidates (total: ${allCandidates.length})`);
-      }
     } catch (err: any) {
       const msg = err?.message?.substring(0, 150) || '';
-      console.error(`  Failed: ${msg}`);
-      if (msg.includes('401') || msg.includes('expired') || msg.includes('CSRF')) {
+      console.error(`  [${orgInfo.name}] Failed: ${msg}`);
+      if (msg.includes('401') || msg.includes('expired')) {
         if (allCandidates.length > 0) {
           console.log(`⚠️  Cookie expired after ${orgsFetched} orgs — returning ${allCandidates.length} candidates collected`);
           break;
@@ -223,8 +178,8 @@ export async function extractPipeline(
   }
 
   const totalElapsed = Math.round((Date.now() - startTime) / 1000);
-  onProgress?.(orgsWithCandidates.length, orgsWithCandidates.length, 'Finalizing...');
-  console.log(`Extraction complete in ${totalElapsed}s: ${allCandidates.length} candidates from ${orgsFetched}/${orgsWithCandidates.length} orgs (scanned ${orgsWithUserId.length} total)`);
+  onProgress?.(orgsWithUserId.length, orgsWithUserId.length, 'Finalizing...');
+  console.log(`Extraction complete in ${totalElapsed}s: ${allCandidates.length} candidates from ${orgsFetched}/${orgsWithUserId.length} orgs`);
 
   if (allCandidates.length === 0) {
     throw new Error('No candidates extracted. Session may be expired.');
@@ -371,10 +326,7 @@ export async function extractPipeline(
     candidates: flatCandidates,
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
-      orgs_scanned: orgsWithUserId.length,
-      orgs_with_candidates: orgsWithCandidates.length,
       orgs_fetched: orgsFetched,
-      scan_seconds: scanElapsed,
       total_seconds: totalElapsed,
     },
   };

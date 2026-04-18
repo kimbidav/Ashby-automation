@@ -282,6 +282,14 @@ async function graphqlQuery<T>(
     });
 
     if (!res.ok) {
+      // 403 usually means stale CSRF — refresh and retry once
+      if (res.status === 403 && attempt < retries) {
+        console.log(`  CSRF likely stale (403), refreshing and retrying...`);
+        try {
+          session.csrfToken = await fetchCsrfToken(session);
+        } catch { /* will fail on next attempt */ }
+        continue;
+      }
       throw new Error(`GraphQL request failed ${res.status} ${res.statusText}`);
     }
 
@@ -397,8 +405,8 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
     }
   }
 
-  // Refresh CSRF token for the new org context
-  session.csrfToken = await fetchCsrfToken(session);
+  // Don't refresh CSRF here — the token is session-scoped, not org-scoped.
+  // graphqlQuery retries with a fresh CSRF on 403, so stale tokens self-heal.
 }
 
 /**
