@@ -51,6 +51,14 @@ export function createAuthHeaders(session: AshbySession): Record<string, string>
   return headers;
 }
 
+const REQUEST_TIMEOUT_MS = 15_000; // 15s per API call — fail fast, don't hang
+
+function withTimeout(ms: number): AbortSignal {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), ms);
+  return controller.signal;
+}
+
 export async function fetchWithSession(
   session: AshbySession,
   url: string,
@@ -61,7 +69,7 @@ export async function fetchWithSession(
     ...(init?.headers as Record<string, string> | undefined)
   };
 
-  const res = await fetch(url, { ...init, headers });
+  const res = await fetch(url, { ...init, headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
   if (!res.ok) {
     throw new Error(`Request failed ${res.status} ${res.statusText} for ${url}`);
   }
@@ -208,7 +216,8 @@ async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<strin
   for (let attempt = 0; attempt <= retries; attempt++) {
     const res = await fetch(url, {
       method: 'GET',
-      headers
+      headers,
+      signal: withTimeout(REQUEST_TIMEOUT_MS),
     });
 
     if (res.ok) {
@@ -278,7 +287,8 @@ async function graphqlQuery<T>(
     const res = await fetch(url, {
       method: 'POST',
       headers,
-      body
+      body,
+      signal: withTimeout(REQUEST_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -385,7 +395,7 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
   }
   headers['content-type'] = 'application/json';
 
-  const res = await fetch(url, { method: 'POST', headers });
+  const res = await fetch(url, { method: 'POST', headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
 
   if (!res.ok) {
     const errorText = await res.text();
@@ -422,7 +432,7 @@ async function switchOrgFast(session: AshbySession, userId: string): Promise<voi
   }
   headers['content-type'] = 'application/json';
 
-  const res = await fetch(url, { method: 'POST', headers });
+  const res = await fetch(url, { method: 'POST', headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
   if (!res.ok) {
     throw new Error(`Fast switch failed: ${res.status}`);
   }
@@ -515,7 +525,8 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
 
   const res = await fetch(url, {
     method: 'GET',
-    headers
+    headers,
+    signal: withTimeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
