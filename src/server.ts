@@ -16,7 +16,7 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
-import { createSessionFromCookie, extractPipeline, ExtractResult } from './api-server-extract.js';
+import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
@@ -84,9 +84,10 @@ app.get('/api/health', (_req: express.Request, res: express.Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    cache_age_seconds: resultCache
+    result_cache_age_seconds: resultCache
       ? Math.round((Date.now() - resultCache.timestamp) / 1000)
       : null,
+    org_cache: getOrgCacheStats(),
   });
 });
 
@@ -109,7 +110,7 @@ function validateCookie(cookie: unknown): { session: ReturnType<typeof createSes
   return { session };
 }
 
-function formatResult(data: ExtractResult): CachedResult['data'] {
+function formatResult(data: ExtractResult & { extraction_stats?: Record<string, number> }): CachedResult['data'] & { extraction_stats?: Record<string, number> } {
   return {
     success: true as const,
     extracted_at: new Date().toISOString(),
@@ -120,6 +121,7 @@ function formatResult(data: ExtractResult): CachedResult['data'] {
     },
     companies: data.companies,
     candidates: data.candidates,
+    extraction_stats: data.extraction_stats,
   };
 }
 

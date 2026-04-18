@@ -401,6 +401,76 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
   session.csrfToken = await fetchCsrfToken(session);
 }
 
+/**
+ * Fast org switch — skips CSRF refresh. Use for the pre-check pass where
+ * we just need to peek at whether an org has candidates. The existing CSRF
+ * token usually works across org switches; if it doesn't, the caller retries.
+ */
+async function switchOrgFast(session: AshbySession, userId: string): Promise<void> {
+  const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
+  const headers = createAuthHeaders(session);
+  if (session.csrfToken) {
+    headers['x-csrf-token'] = session.csrfToken;
+  }
+  headers['content-type'] = 'application/json';
+
+  const res = await fetch(url, { method: 'POST', headers });
+  if (!res.ok) {
+    throw new Error(`Fast switch failed: ${res.status}`);
+  }
+
+  // Update cookies from response if present
+  const setCookieHeaders = res.headers.get('set-cookie');
+  if (setCookieHeaders) {
+    const cookies = setCookieHeaders.split(',').map(c => c.trim());
+    for (const cookie of cookies) {
+      const [nameValue] = cookie.split(';');
+      const [name, value] = nameValue.split('=');
+      if (name && value) {
+        session.cookies[name.trim()] = value.trim();
+      }
+    }
+  }
+}
+
+/**
+ * Quick check: does this org have any active applications?
+ * Uses a minimal query (1 result, no enrichment fields) to be as fast as possible.
+ */
+export async function quickCheckOrgHasCandidates(
+  session: AshbySession,
+  userId: string,
+): Promise<boolean> {
+  await switchOrgFast(session, userId);
+
+  const query = `
+    query QuickCheck($limit: Int) {
+      result: applicationsByPrebuiltView(prebuiltView: Active, limit: $limit) {
+        results { id }
+        moreDataAvailable
+      }
+    }
+  `;
+
+  try {
+    const data = await graphqlQuery<{ result: { results: { id: string }[]; moreDataAvailable: boolean } }>(
+      session, 'QuickCheck', query, { limit: 1 }, false
+    );
+    return data.result.results.length > 0;
+  } catch {
+    // If CSRF is stale, refresh once and retry
+    try {
+      session.csrfToken = await fetchCsrfToken(session);
+      const data = await graphqlQuery<{ result: { results: { id: string }[]; moreDataAvailable: boolean } }>(
+        session, 'QuickCheck', query, { limit: 1 }, false
+      );
+      return data.result.results.length > 0;
+    } catch {
+      return false; // Skip this org on repeated failure
+    }
+  }
+}
+
 interface AvailableIdentityResponse {
   user: {
     id: string;
