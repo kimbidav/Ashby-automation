@@ -148,7 +148,10 @@ export async function extractPipeline(
   const allJobs: Job[] = [];
   let allCandidates: Candidate[] = [];
   let orgsFetched = 0;
+  const failedOrgs: typeof orgsWithUserId = [];
+  let authDead = false;
 
+  // ── Pass 1: fetch all orgs ─────────────────────────────────────────────
   for (let i = 0; i < orgsWithUserId.length; i++) {
     const orgInfo = orgsWithUserId[i];
 
@@ -172,11 +175,35 @@ export async function extractPipeline(
       const msg = err?.message?.substring(0, 150) || '';
       console.error(`  [${orgInfo.name}] Failed: ${msg}`);
       if (msg.includes('401') || msg.includes('expired')) {
+        authDead = true;
         if (allCandidates.length > 0) {
           console.log(`⚠️  Cookie expired after ${orgsFetched} orgs — returning ${allCandidates.length} candidates collected`);
           break;
         }
         throw err;
+      }
+      failedOrgs.push(orgInfo);
+    }
+  }
+
+  // ── Pass 2: retry failed orgs once (transient errors) ──────────────────
+  if (failedOrgs.length > 0 && !authDead) {
+    console.log(`\nRetrying ${failedOrgs.length} failed org(s)...`);
+    for (const orgInfo of failedOrgs) {
+      onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Retrying: ${orgInfo.name}`);
+      try {
+        const { companies, jobs, candidates } = await fetchPipelineForOrg(
+          session,
+          orgInfo.id,
+          orgInfo.userId
+        );
+        allCompanies.push(...companies);
+        allJobs.push(...jobs);
+        allCandidates.push(...candidates);
+        orgsFetched++;
+        console.log(`  ✓ Retry succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
+      } catch (err: any) {
+        console.error(`  ✗ Retry failed for ${orgInfo.name}: ${err?.message?.substring(0, 100)}`);
       }
     }
   }
@@ -343,6 +370,8 @@ export async function extractPipeline(
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
       orgs_fetched: orgsFetched,
+      orgs_failed: orgsWithUserId.length - orgsFetched,
+      orgs_retried: failedOrgs.length,
       total_seconds: totalElapsed,
     },
   };
