@@ -84,6 +84,7 @@ app.get('/api/health', (_req: express.Request, res: express.Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
+    stored_cookie_configured: !!STORED_COOKIE,
     result_cache_age_seconds: resultCache
       ? Math.round((Date.now() - resultCache.timestamp) / 1000)
       : null,
@@ -91,14 +92,27 @@ app.get('/api/health', (_req: express.Request, res: express.Response) => {
   });
 });
 
+// ── Stored session from env (Playwright-bootstrapped, lasts ~7 days) ──────
+
+const STORED_COOKIE = process.env.ASHBY_SESSION_COOKIE || '';
+if (STORED_COOKIE) {
+  console.log('ASHBY_SESSION_COOKIE is set — extraction will use the stored session (no cookie paste needed)');
+}
+
 // ── Cookie validation helper ──────────────────────────────────────────────
 
 function validateCookie(cookie: unknown): { session: ReturnType<typeof createSessionFromCookie> } | { error: string; status: number } {
-  if (!cookie || typeof cookie !== 'string' || !cookie.trim()) {
-    return { error: 'Missing or empty "cookie" field in request body.', status: 400 };
+  // Priority: request body cookie > env var stored cookie
+  const raw = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : STORED_COOKIE;
+
+  if (!raw) {
+    return {
+      error: 'No cookie provided and ASHBY_SESSION_COOKIE env var is not set. Either paste a cookie or set the env var on Railway.',
+      status: 400,
+    };
   }
 
-  const session = createSessionFromCookie(cookie.trim());
+  const session = createSessionFromCookie(raw);
 
   if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
     return {
