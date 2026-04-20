@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -137,7 +137,11 @@ export async function extractPipeline(
   }
 
   const orgsWithUserId = orgInfos.filter(o => o.userId);
-  console.log(`Found ${orgInfos.length} org(s) (${orgsWithUserId.length} with userId). No CSRF refresh per org — lazy retry on 403.`);
+  // Remember the first org so we can restore context after extraction.
+  // change_user modifies USER-LEVEL state (not per-session), so without
+  // restoration the user's browser ends up in the last org we visited.
+  const firstOrg = orgsWithUserId[0];
+  console.log(`Found ${orgInfos.length} org(s) (${orgsWithUserId.length} with userId). Will restore to ${firstOrg?.name || '?'} after extraction.`);
   onProgress?.(0, orgsWithUserId.length, 'Starting extraction...');
 
   const allCompanies: Company[] = [];
@@ -174,6 +178,18 @@ export async function extractPipeline(
         }
         throw err;
       }
+    }
+  }
+
+  // Restore the user's org context to the first org so their browser
+  // session isn't left stranded in some random client's org.
+  if (firstOrg?.userId) {
+    try {
+      onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Restoring context to ${firstOrg.name}...`);
+      await fetchPipelineForOrg(session, firstOrg.id, firstOrg.userId);
+      console.log(`✓ Restored org context to ${firstOrg.name}`);
+    } catch (err: any) {
+      console.warn(`⚠️  Could not restore org context: ${err?.message?.substring(0, 100)}`);
     }
   }
 
