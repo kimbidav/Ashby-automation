@@ -124,7 +124,7 @@ function validateCookie(cookie: unknown): { session: ReturnType<typeof createSes
   return { session };
 }
 
-function formatResult(data: ExtractResult & { extraction_stats?: Record<string, number> }): CachedResult['data'] & { extraction_stats?: Record<string, number> } {
+function formatResult(data: ExtractResult & { extraction_stats?: Record<string, unknown> }): CachedResult['data'] & { extraction_stats?: Record<string, unknown> } {
   return {
     success: true as const,
     extracted_at: new Date().toISOString(),

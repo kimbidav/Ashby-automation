@@ -127,7 +127,7 @@ export function clearOrgCache() {
 export async function extractPipeline(
   session: AshbySession,
   onProgress?: ProgressCallback,
-): Promise<ExtractResult & { extraction_stats: Record<string, number> }> {
+): Promise<ExtractResult & { extraction_stats: Record<string, unknown> }> {
   const startTime = Date.now();
 
   // Discover orgs
@@ -186,11 +186,14 @@ export async function extractPipeline(
     }
   }
 
-  // ── Pass 2: retry failed orgs once (transient errors) ──────────────────
-  if (failedOrgs.length > 0 && !authDead) {
-    console.log(`\nRetrying ${failedOrgs.length} failed org(s)...`);
-    for (const orgInfo of failedOrgs) {
-      onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Retrying: ${orgInfo.name}`);
+  // ── Pass 2 & 3: retry failed orgs up to 2 more times ────────────────
+  let stillFailed = [...failedOrgs];
+  const MAX_RETRIES = 2;
+  for (let retry = 1; retry <= MAX_RETRIES && stillFailed.length > 0 && !authDead; retry++) {
+    console.log(`\nRetry pass ${retry}/${MAX_RETRIES}: ${stillFailed.length} org(s)...`);
+    const nextFailed: typeof orgsWithUserId = [];
+    for (const orgInfo of stillFailed) {
+      onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Retry ${retry}: ${orgInfo.name}`);
       try {
         const { companies, jobs, candidates } = await fetchPipelineForOrg(
           session,
@@ -201,11 +204,13 @@ export async function extractPipeline(
         allJobs.push(...jobs);
         allCandidates.push(...candidates);
         orgsFetched++;
-        console.log(`  ✓ Retry succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
+        console.log(`  ✓ Retry ${retry} succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
       } catch (err: any) {
-        console.error(`  ✗ Retry failed for ${orgInfo.name}: ${err?.message?.substring(0, 100)}`);
+        console.error(`  ✗ Retry ${retry} failed for ${orgInfo.name}: ${err?.message?.substring(0, 100)}`);
+        nextFailed.push(orgInfo);
       }
     }
+    stillFailed = nextFailed;
   }
 
   // Restore the user's org context to the first org so their browser
@@ -370,9 +375,11 @@ export async function extractPipeline(
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
       orgs_fetched: orgsFetched,
-      orgs_failed: orgsWithUserId.length - orgsFetched,
+      orgs_failed: stillFailed.length,
       orgs_retried: failedOrgs.length,
+      failed_org_names: stillFailed.map(o => o.name),
       total_seconds: totalElapsed,
+      complete: stillFailed.length === 0,
     },
   };
 }
