@@ -348,4 +348,6 @@ app.post('/api/calendar/add', async (req: express.Request, res: express.Response
 
 app.listen(PORT, () => {
   console.log(`Ashby extraction API listening on port ${PORT}`);
+  // Periodic cleanup of stale jobs (every 5 minutes)
+  setInterval(cleanupOldJobs, 5 * 60 * 1000);
 });
