@@ -1425,18 +1425,49 @@ export async function enrichCandidatesWithDetails(
   session: AshbySession,
   candidates: Candidate[],
   orgInfos: Array<{ id: string; name: string; userId: string }>,
-  options: { maxConcurrent?: number; fetchAll?: boolean } = {}
+  options: {
+    maxConcurrent?: number;
+    fetchAll?: boolean;
+    shouldEnrich?: (c: Candidate) => boolean;
+    deadlineMs?: number;
+  } = {}
 ): Promise<Candidate[]> {
-  const { maxConcurrent = 5, fetchAll = false } = options;
+  const {
+    maxConcurrent = 5,
+    fetchAll = false,
+    shouldEnrich,
+    deadlineMs,
+  } = options;
 
-  console.log(`\nEnriching ${candidates.length} candidates with interview details...`);
+  const startedAt = Date.now();
+  const deadlineAt = deadlineMs ? startedAt + deadlineMs : Number.POSITIVE_INFINITY;
+  const overBudget = () => Date.now() > deadlineAt;
+
+  // A candidate gets the detail-query treatment when the caller's predicate
+  // says so (most flexible), else when `fetchAll`, else when the bulk
+  // `needsScheduling` heuristic flagged it. Predicate wins because callers
+  // know best which records' bulk data is suspicious.
+  const wantEnrich = (c: Candidate): boolean => {
+    if (shouldEnrich) return shouldEnrich(c);
+    if (fetchAll) return true;
+    return !!c.needsScheduling;
+  };
+
+  const enrichTargets = candidates.filter(wantEnrich);
+  console.log(
+    `\nEnriching ${enrichTargets.length}/${candidates.length} candidates with interview details` +
+      (deadlineMs ? ` (deadline ${Math.round(deadlineMs / 1000)}s)` : '') +
+      `...`,
+  );
 
   // Create a map of orgId -> userId for quick lookup
   const orgIdToUserId = new Map(orgInfos.map(org => [org.id, org.userId]));
 
-  // Group candidates by org to minimize org switching
+  // Group ONLY the enrichment targets by org. Candidates that won't be
+  // enriched are passed through unchanged at the end so we don't waste org
+  // switches on them.
   const candidatesByOrg = new Map<string, Candidate[]>();
-  for (const candidate of candidates) {
+  for (const candidate of enrichTargets) {
     if (!candidatesByOrg.has(candidate.orgId)) {
       candidatesByOrg.set(candidate.orgId, []);
     }
@@ -1446,15 +1477,23 @@ export async function enrichCandidatesWithDetails(
   console.log(`  Grouped into ${candidatesByOrg.size} organizations\n`);
 
   // Process candidates org by org to minimize context switching
-  const enrichedCandidates: Candidate[] = [];
+  // Keyed by applicationId so the final merge preserves order and lets us
+  // overwrite originals with the enriched copies.
+  const enrichedById = new Map<string, Candidate>();
   let currentOrgContext: string | null = null;
+  let processed = 0;
+  let aborted = false;
 
   for (const [orgId, orgCandidates] of candidatesByOrg.entries()) {
+    if (overBudget()) {
+      aborted = true;
+      console.warn(`  ⏱  Deadline reached; skipping remaining orgs`);
+      break;
+    }
     const userId = orgIdToUserId.get(orgId);
 
     if (!userId) {
       console.log(`  ⚠️  No userId for org ${orgId}, skipping ${orgCandidates.length} candidates`);
-      enrichedCandidates.push(...orgCandidates);
       continue;
     }
 
@@ -1468,22 +1507,21 @@ export async function enrichCandidatesWithDetails(
         currentOrgContext = orgId;
       } catch (error: any) {
         console.error(`  ✗ Failed to switch to org ${orgId}:`, error.message);
-        enrichedCandidates.push(...orgCandidates);
         continue;
       }
     }
 
     // Process candidates in batches within this org
     for (let i = 0; i < orgCandidates.length; i += maxConcurrent) {
+      if (overBudget()) {
+        aborted = true;
+        console.warn(`  ⏱  Deadline reached mid-batch; ${enrichTargets.length - processed} candidate(s) left unenriched`);
+        break;
+      }
       const batch = orgCandidates.slice(i, i + maxConcurrent);
 
       const enrichedBatch = await Promise.all(
         batch.map(async (candidate) => {
-          // Skip if not fetching all and candidate doesn't need enrichment
-          if (!fetchAll && !candidate.needsScheduling) {
-            return candidate;
-          }
-
           const details = await fetchApplicationDetails(session, candidate.applicationId);
 
         if (!details) {
@@ -1583,12 +1621,22 @@ export async function enrichCandidatesWithDetails(
         })
       );
 
-      enrichedCandidates.push(...enrichedBatch);
+      for (const c of enrichedBatch) enrichedById.set(c.applicationId, c);
+      processed += enrichedBatch.length;
     }
+
+    if (aborted) break;
 
     console.log(`  ✓ Enriched ${orgCandidates.length} candidates from ${orgInfos.find(o => o.id === orgId)?.name || orgId}`);
   }
 
-  console.log(`\n✓ Enrichment complete: ${enrichedCandidates.length}/${candidates.length} candidates\n`);
-  return enrichedCandidates;
+  // Merge: keep original order; substitute enriched copy when present.
+  const merged = candidates.map((c) => enrichedById.get(c.applicationId) ?? c);
+  const elapsed = Math.round((Date.now() - startedAt) / 1000);
+  console.log(
+    `\n✓ Enrichment ${aborted ? 'partial (timed out)' : 'complete'}: ` +
+      `${enrichedById.size}/${enrichTargets.length} target(s) enriched in ${elapsed}s ` +
+      `(${candidates.length - enrichedById.size} pass-through)\n`,
+  );
+  return merged;
 }

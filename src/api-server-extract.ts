@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -211,6 +211,58 @@ export async function extractPipeline(
       }
     }
     stillFailed = nextFailed;
+  }
+
+  // ── Pass 4: targeted per-application enrichment ───────────────────────
+  // The bulk applicationsByPrebuiltView query returns interview_events
+  // inline, but the field is sometimes incomplete for newly-moved-stage
+  // candidates: decision_status updates to "Scheduled" before the new
+  // stage's InterviewEvent records materialize in the bulk view. Re-fetch
+  // detailed application data for those candidates so the snapshot reflects
+  // what's actually on Ashby's calendar (interviewer, time, scorecard).
+  //
+  // Bounded by a deadline so a slow/rate-limited Ashby session can't blow
+  // the frontend's 4-minute extract timeout. On deadline we return whatever
+  // got enriched; the remaining candidates keep their bulk data.
+  if (!authDead && allCandidates.length > 0) {
+    const elapsedSoFar = Date.now() - startTime;
+    // Leave at least 90s for the rest of the pipeline (restore + flatten +
+    // network return). Anything above 60s of remaining budget gets spent on
+    // enrichment; below that we skip rather than risk timing out.
+    const budgetForEnrich = Math.max(0, 240_000 - elapsedSoFar - 90_000);
+    if (budgetForEnrich >= 60_000) {
+      const SUSPECT_STATUS = new Set([
+        'scheduled',
+        'waiting on feedback',
+        'waiting on availability',
+        'waiting on submission',
+        'booking link sent',
+        'needs scheduling',
+      ]);
+      const shouldEnrich = (c: Candidate): boolean => {
+        const status = (c.decisionStatus || '').trim().toLowerCase();
+        if (SUSPECT_STATUS.has(status)) return true;
+        // Catch records where bulk fetch returned zero events but the
+        // candidate looks active — likely missing data.
+        if (c.stageType && !(c.interviewEvents && c.interviewEvents.length)) {
+          return true;
+        }
+        return c.needsScheduling === true;
+      };
+      try {
+        onProgress?.(orgsWithUserId.length, orgsWithUserId.length, 'Enriching scheduled candidates...');
+        allCandidates = await enrichCandidatesWithDetails(
+          session,
+          allCandidates,
+          orgsWithUserId,
+          { maxConcurrent: 5, shouldEnrich, deadlineMs: budgetForEnrich },
+        );
+      } catch (err: any) {
+        console.warn(`⚠️  Enrichment pass failed (non-fatal): ${err?.message?.substring(0, 150)}`);
+      }
+    } else {
+      console.log(`Skipping enrichment pass (only ${Math.round(budgetForEnrich / 1000)}s of budget left)`);
+    }
   }
 
   // Restore the user's org context to the first org so their browser
