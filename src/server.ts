@@ -17,6 +17,8 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
+import { loadSession } from './session.js';
+import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
@@ -101,27 +103,47 @@ if (STORED_COOKIE) {
 
 // ── Cookie validation helper ──────────────────────────────────────────────
 
-function validateCookie(cookie: unknown): { session: ReturnType<typeof createSessionFromCookie> } | { error: string; status: number } {
-  // Priority: request body cookie > env var stored cookie
+/**
+ * Resolve an Ashby session by trying, in order:
+ *   1. Cookie in the request body (legacy paste flow)
+ *   2. STORED_COOKIE env var (legacy Railway deploy)
+ *   3. The persistent Playwright profile via loadSession() — this is the
+ *      no-paste happy path for local runs: log in once with
+ *      `npm run start -- auth`, the session lives in .playwright-browser-data/
+ *      and `.ashby-session.json` for ~7 days, and every extract call here
+ *      transparently picks it up without any cookie wrangling on the caller.
+ */
+async function validateCookie(cookie: unknown): Promise<{ session: AshbySession } | { error: string; status: number }> {
   const raw = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : STORED_COOKIE;
 
-  if (!raw) {
-    return {
-      error: 'No cookie provided and ASHBY_SESSION_COOKIE env var is not set. Either paste a cookie or set the env var on Railway.',
-      status: 400,
-    };
+  if (raw) {
+    const session = createSessionFromCookie(raw);
+    if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+      return {
+        error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
+        status: 400,
+      };
+    }
+    return { session };
   }
 
-  const session = createSessionFromCookie(raw);
-
-  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
-    return {
-      error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
-      status: 400,
-    };
+  // No cookie supplied — fall through to the persistent browser session.
+  try {
+    const session = await loadSession();
+    if (session?.cookies?.['ashby_session_token'] || session?.cookies?.['authenticated']) {
+      return { session };
+    }
+  } catch {
+    // Persistent session unavailable — fall through to the 400 below.
   }
 
-  return { session };
+  return {
+    // 401 (not 400): from the caller's perspective this is "no auth," which
+    // is what the dashboard's session_dead branch keys off of to surface
+    // the "Log into Ashby" recovery instructions.
+    error: "No Ashby session available. Run 'npm run start -- auth' to establish a persistent session, set ASHBY_SESSION_COOKIE, or pass a cookie in the request body.",
+    status: 401,
+  };
 }
 
 function formatResult(data: ExtractResult & { extraction_stats?: Record<string, unknown> }): CachedResult['data'] & { extraction_stats?: Record<string, unknown> } {
@@ -166,7 +188,7 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
     return;
   }
 
-  const validation = validateCookie(req.body.cookie);
+  const validation = await validateCookie(req.body.cookie);
   if ('error' in validation) {
     res.status(validation.status).json({ error: validation.error });
     return;
@@ -184,7 +206,7 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
 
 // ── Async extraction (start + poll) ──────────────────────────────────────
 
-app.post('/api/extract/start', (req: express.Request, res: express.Response) => {
+app.post('/api/extract/start', async (req: express.Request, res: express.Response) => {
   const force = req.body.force === true;
   // Return cache if fresh — no need to even validate the cookie
   const cached = !force ? getCachedResult() : null;
@@ -203,7 +225,7 @@ app.post('/api/extract/start', (req: express.Request, res: express.Response) => 
     return;
   }
 
-  const validation = validateCookie(req.body.cookie);
+  const validation = await validateCookie(req.body.cookie);
   if ('error' in validation) {
     res.status(validation.status).json({ error: validation.error });
     return;
