@@ -16,6 +16,7 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
@@ -228,6 +229,25 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
 
 // ── Live-auth endpoints ─────────────────────────────────────────────────
 
+async function clearStaleSingletonLocks(profileDir: string): Promise<void> {
+  // Chromium leaves SingletonLock / SingletonCookie / SingletonSocket files
+  // when it shuts down ungracefully (crash, kill -9, Cmd-Q during navigation).
+  // Subsequent launches see these and abort with "Failed to create a
+  // ProcessSingleton." Since this server is the sole owner of the profile,
+  // any of those files we find when liveContext is null is by definition
+  // stale, so we delete them. If a real Chromium process is still holding
+  // the profile, launchPersistentContext will fail anyway and we surface
+  // the error to the user.
+  for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      await fs.unlink(path.join(profileDir, name));
+      console.log(`[live-auth] cleared stale ${name}`);
+    } catch {
+      // Doesn't exist — that's the happy path; nothing to do.
+    }
+  }
+}
+
 app.post('/api/auth/start', async (_req: express.Request, res: express.Response) => {
   if (liveContext) {
     // Already up. Return current status instead of double-launching.
@@ -242,6 +262,11 @@ app.post('/api/auth/start', async (_req: express.Request, res: express.Response)
   }
 
   try {
+    // Clear stale singleton files from a previous ungraceful shutdown.
+    // Safe because the only owner of this profile is this server process,
+    // and we just confirmed liveContext === null above.
+    await clearStaleSingletonLocks(PROFILE_DIR);
+
     // Launch the persistent context HEADED so the user can do SSO. The
     // context stays attached to this Node process; on close we clear the
     // module-level handle so the next call sees a clean state.
