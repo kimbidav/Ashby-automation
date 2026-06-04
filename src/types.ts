@@ -35,6 +35,8 @@ export interface InterviewEvent {
   interviewTitle: string;
   startTime: string;
   endTime: string;
+  interviewStageId?: string | null;
+  interviewStageTitle?: string | null;
   interviewers: Array<{
     name: string;
     email: string;
@@ -58,6 +60,8 @@ export interface Candidate {
   email: string | null;
   phone: string | null;
   currentStage: string; // Decision status like "Needs Decision", "Scheduled"
+  currentStageId?: string | null;
+  currentStageEnteredAt?: string | null;
   pipelineStage: string | null; // Actual pipeline stage like "Technical Interviews", "Hard Skills Check"
   stageType: string | null;
   currentStageIndex: number | null;
@@ -103,4 +107,3 @@ export interface AshbySession {
   csrfToken?: string;
   orgIds: string[];
 }
-

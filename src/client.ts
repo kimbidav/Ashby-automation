@@ -21,7 +21,7 @@
  * API calls are needed. Data is extracted during normalizePipelineData().
  */
 import fetch from 'cross-fetch';
-import { AshbySession, Candidate, Company, Job } from './types.js';
+import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
 
 export interface RawPipelineRow {
   // Shape will be filled in once endpoints are known.
@@ -1162,6 +1162,8 @@ function normalizePipelineData(
       email: null,
       phone: null,
       currentStage,
+      currentStageId: app.currentInterviewStage?.id || null,
+      currentStageEnteredAt: null,
       pipelineStage,
       stageType,
       currentStageIndex,
@@ -1294,6 +1296,121 @@ function extractFeedbackText(submittedFormRender?: any): string | null {
   return parts.length > 0 ? parts.join(' | ') : null;
 }
 
+function displayUserName(user: any): string {
+  if (!user || typeof user !== 'object') return '';
+  if (typeof user.name === 'string' && user.name.trim()) return user.name.trim();
+  const name = `${user.firstName || ''} ${user.lastName || ''}`.trim();
+  return name || user.email || '';
+}
+
+function normalizeInterviewEvent(event: any, stage?: any): InterviewEvent | null {
+  if (!event?.id || !event?.startTime || !event?.endTime) return null;
+  return {
+    id: event.id,
+    interviewTitle: event.interview?.title || event.title || '',
+    startTime: event.startTime,
+    endTime: event.endTime,
+    interviewStageId: stage?.id || event.interviewStage?.id || null,
+    interviewStageTitle: stage?.title || event.interviewStage?.title || null,
+    interviewers: (event.interviewerEvents || []).map((ie: any) => ({
+      name: displayUserName(ie.interviewer),
+      email: ie.interviewer?.email || '',
+      overallRecommendation: ie.scorecardSubmission?.overallRecommendation || null,
+      isFeedbackSubmitted: !!ie.isFeedbackSubmitted
+    }))
+  };
+}
+
+function upsertInterviewEvent(eventsById: Map<string, InterviewEvent>, event: InterviewEvent | null) {
+  if (!event) return;
+  const existing = eventsById.get(event.id);
+  if (!existing) {
+    eventsById.set(event.id, event);
+    return;
+  }
+  eventsById.set(event.id, {
+    ...existing,
+    ...event,
+    interviewStageId: event.interviewStageId || existing.interviewStageId || null,
+    interviewStageTitle: event.interviewStageTitle || existing.interviewStageTitle || null,
+    interviewers: event.interviewers.length >= existing.interviewers.length
+      ? event.interviewers
+      : existing.interviewers
+  });
+}
+
+function collectInterviewEventsFromDetails(details: {
+  interviewEvents?: any[];
+  historyEvents?: any[];
+  activeSubprocesses?: any[];
+}): InterviewEvent[] {
+  const eventsById = new Map<string, InterviewEvent>();
+
+  for (const event of details.interviewEvents || []) {
+    upsertInterviewEvent(eventsById, normalizeInterviewEvent(event));
+  }
+
+  for (const historyEvent of details.historyEvents || []) {
+    const stage = historyEvent.newInterviewStage || null;
+    for (const event of historyEvent.interviewEvents || []) {
+      upsertInterviewEvent(eventsById, normalizeInterviewEvent(event, stage));
+    }
+  }
+
+  for (const subprocess of details.activeSubprocesses || []) {
+    if (subprocess?.__typename !== 'InterviewSchedule') continue;
+    const stage = subprocess.interviewStage || null;
+    for (const event of subprocess.scheduledInterviewEvents || []) {
+      upsertInterviewEvent(eventsById, normalizeInterviewEvent(event, stage));
+    }
+    for (const event of subprocess.unscheduledInterviewEvents || []) {
+      upsertInterviewEvent(eventsById, normalizeInterviewEvent(event, stage));
+    }
+  }
+
+  return Array.from(eventsById.values()).sort(
+    (a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
+  );
+}
+
+function collectRawInterviewEventsFromDetails(details: {
+  interviewEvents?: any[];
+  historyEvents?: any[];
+  activeSubprocesses?: any[];
+}): any[] {
+  const byId = new Map<string, any>();
+  for (const event of details.interviewEvents || []) {
+    if (event?.id) byId.set(event.id, event);
+  }
+  for (const historyEvent of details.historyEvents || []) {
+    for (const event of historyEvent.interviewEvents || []) {
+      if (event?.id) byId.set(event.id, event);
+    }
+  }
+  for (const subprocess of details.activeSubprocesses || []) {
+    if (subprocess?.__typename !== 'InterviewSchedule') continue;
+    for (const event of [
+      ...(subprocess.scheduledInterviewEvents || []),
+      ...(subprocess.unscheduledInterviewEvents || []),
+    ]) {
+      if (event?.id) byId.set(event.id, event);
+    }
+  }
+  return Array.from(byId.values());
+}
+
+function getCurrentStageEnteredAt(details: {
+  currentInterviewStage?: any;
+  historyEvents?: any[];
+}): string | null {
+  const currentStageId = details.currentInterviewStage?.id;
+  if (!currentStageId) return null;
+  const candidates = (details.historyEvents || [])
+    .filter((event: any) => event?.newInterviewStage?.id === currentStageId && event.enteredStageAt)
+    .sort((a: any, b: any) => new Date(b.enteredStageAt).getTime() - new Date(a.enteredStageAt).getTime());
+  return candidates[0]?.enteredStageAt || null;
+}
+
 /**
  * Fetch detailed application data including interview feedback and ratings
  */
@@ -1302,6 +1419,8 @@ export async function fetchApplicationDetails(
   applicationId: string
 ): Promise<{
   interviewEvents: any[];
+  historyEvents: any[];
+  activeSubprocesses: any[];
   applicationStatus: any;
   currentInterviewStage: any;
   interviewPlan: any;
@@ -1391,6 +1510,8 @@ export async function fetchApplicationDetails(
             isFeedbackSubmitted: boolean;
           }>;
         }>;
+        historyEvents?: any[];
+        activeSubprocesses?: any[];
       };
     }
 
@@ -1407,6 +1528,8 @@ export async function fetchApplicationDetails(
 
     return {
       interviewEvents: response.application.interviewEvents || [],
+      historyEvents: response.application.historyEvents || [],
+      activeSubprocesses: response.application.activeSubprocesses || [],
       applicationStatus: response.application.applicationStatus,
       currentInterviewStage: response.application.currentInterviewStage || null,
       interviewPlan: response.application.interviewPlan || null,
@@ -1528,28 +1651,21 @@ export async function enrichCandidatesWithDetails(
           return candidate; // Return original if fetch failed
         }
 
-        // Extract interview events
-        const interviewEvents = details.interviewEvents.map((event: any) => ({
-          id: event.id,
-          interviewTitle: event.interview.title,
-          startTime: event.startTime,
-          endTime: event.endTime,
-          interviewers: event.interviewerEvents.map((ie: any) => ({
-            name: `${ie.interviewer.firstName} ${ie.interviewer.lastName}`,
-            email: ie.interviewer.email,
-            overallRecommendation: ie.scorecardSubmission?.overallRecommendation || null,
-            isFeedbackSubmitted: ie.isFeedbackSubmitted
-          }))
-        }));
+        // Extract interview events from the application, stage history, and
+        // active scheduling subprocesses. The bulk application list can lag
+        // behind the candidate's current stage; active subprocesses are what
+        // the Ashby UI uses for newly scheduled onsite/final-loop blocks.
+        const interviewEvents = collectInterviewEventsFromDetails(details);
+        const rawInterviewEvents = collectRawInterviewEventsFromDetails(details);
 
         // Extract all feedback
-        const allFeedback = details.interviewEvents.flatMap((event: any) =>
-          event.interviewerEvents
+        const allFeedback = rawInterviewEvents.flatMap((event: any) =>
+          (event.interviewerEvents || [])
             .filter((ie: any) => ie.isFeedbackSubmitted)
             .map((ie: any) => ({
-              interviewTitle: event.interview.title,
-              interviewer: `${ie.interviewer.firstName} ${ie.interviewer.lastName}`,
-              interviewerEmail: ie.interviewer.email,
+              interviewTitle: event.interview?.title || event.title || '',
+              interviewer: displayUserName(ie.interviewer),
+              interviewerEmail: ie.interviewer?.email || '',
               submittedAt: ie.scorecardSubmission?.submittedAt || event.endTime,
               overallRecommendation: ie.scorecardSubmission?.overallRecommendation || null,
               feedbackText: extractFeedbackText(ie.scorecardSubmission?.submittedFormRender),
@@ -1563,6 +1679,7 @@ export async function enrichCandidatesWithDetails(
           .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
 
         const latestFeedback = sortedFeedback[0];
+        const currentStageEnteredAt = getCurrentStageEnteredAt(details);
 
         // Calculate stage position in the pipeline
         let currentStageIndex: number | null = null;
@@ -1608,6 +1725,15 @@ export async function enrichCandidatesWithDetails(
         return {
           ...candidate,
           pipelineStage: details.currentInterviewStage?.title || candidate.pipelineStage,
+          currentStageId: details.currentInterviewStage?.id || candidate.currentStageId || null,
+          currentStageEnteredAt,
+          stageType: details.currentInterviewStage?.stageType || candidate.stageType,
+          currentStage: details.applicationStatus?.description || candidate.currentStage,
+          decisionStatus: details.applicationStatus?.description || candidate.decisionStatus,
+          statusPriority: details.applicationStatus?.priority ?? candidate.statusPriority,
+          statusDueAt: details.applicationStatus?.dueAt ?? candidate.statusDueAt,
+          lastActivityAt: currentStageEnteredAt || candidate.lastActivityAt,
+          daysInStage: currentStageEnteredAt ? computeDaysInStage(currentStageEnteredAt) : candidate.daysInStage,
           currentStageIndex,
           totalStages,
           stageProgress,

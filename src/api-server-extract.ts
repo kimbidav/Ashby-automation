@@ -6,7 +6,7 @@
  *   - Returns data in-memory instead of writing CSV/JSON files
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
-import { AshbySession, Candidate, Company, Job } from './types.js';
+import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
 import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails } from './client.js';
 
 export interface ExtractedInterviewEvent {
@@ -14,6 +14,8 @@ export interface ExtractedInterviewEvent {
   interview_title: string;
   start_time: string;
   end_time: string;
+  interview_stage_id?: string | null;
+  interview_stage_title?: string | null;
   interviewers: Array<{
     name: string;
     email: string;
@@ -55,6 +57,57 @@ export interface ExtractResult {
   companies: Company[];
   jobs: Job[];
   candidates: ExtractedCandidate[];
+}
+
+function eventKey(event: InterviewEvent): string {
+  return `${event.id}|${event.startTime}|${event.interviewTitle}`;
+}
+
+function getCurrentStageEvents(candidate: Candidate, sortedEvents: InterviewEvent[]): InterviewEvent[] {
+  const currentStageId = candidate.currentStageId || null;
+  const currentStageTitle = (candidate.pipelineStage || '').trim().toLowerCase();
+
+  const byStageId = currentStageId
+    ? sortedEvents.filter((event) => event.interviewStageId === currentStageId)
+    : [];
+  if (byStageId.length > 0) return byStageId;
+
+  const byStageTitle = currentStageTitle
+    ? sortedEvents.filter((event) => (event.interviewStageTitle || '').trim().toLowerCase() === currentStageTitle)
+    : [];
+  if (byStageTitle.length > 0) return byStageTitle;
+
+  const now = Date.now();
+  const futureEvents = sortedEvents.filter((event) => new Date(event.startTime).getTime() >= now);
+  const status = (candidate.decisionStatus || '').toLowerCase();
+  if (futureEvents.length > 0 && /scheduled|availability|booking/.test(status)) {
+    return futureEvents;
+  }
+
+  const mostRecent = sortedEvents[0];
+  if (!mostRecent) return [];
+  const mostRecentDate = new Date(mostRecent.startTime);
+  return sortedEvents.filter((event) => {
+    const daysDiff = (mostRecentDate.getTime() - new Date(event.startTime).getTime()) / (24 * 60 * 60 * 1000);
+    return daysDiff <= 1;
+  });
+}
+
+function splitCurrentAndPreviousInterviews(candidate: Candidate): {
+  currentInterviews: InterviewEvent[];
+  previousInterviews: InterviewEvent[];
+} {
+  const sortedEvents = [...(candidate.interviewEvents || [])].sort((a, b) =>
+    new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+  );
+  const currentInterviews = getCurrentStageEvents(candidate, sortedEvents);
+  const currentKeys = new Set(currentInterviews.map(eventKey));
+  return {
+    currentInterviews: [...currentInterviews].sort((a, b) =>
+      new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
+    ),
+    previousInterviews: sortedEvents.filter((event) => !currentKeys.has(eventKey(event))),
+  };
 }
 
 /**
@@ -300,22 +353,7 @@ export async function extractPipeline(
     let interviewHistorySummary = '';
 
     if (cand.interviewEvents && cand.interviewEvents.length > 0) {
-      const sortedEvents = [...cand.interviewEvents].sort((a, b) =>
-        new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
-      );
-
-      const mostRecentDate = new Date(sortedEvents[0].startTime);
-      const currentInterviews: typeof sortedEvents = [];
-      const previousInterviews: typeof sortedEvents = [];
-
-      for (const event of sortedEvents) {
-        const daysDiff = (mostRecentDate.getTime() - new Date(event.startTime).getTime()) / (24 * 60 * 60 * 1000);
-        if (daysDiff <= 1) {
-          currentInterviews.push(event);
-        } else {
-          previousInterviews.push(event);
-        }
-      }
+      const { currentInterviews, previousInterviews } = splitCurrentAndPreviousInterviews(cand);
 
       if (currentInterviews.length > 0) {
         const parts = currentInterviews.map(event => {
@@ -347,7 +385,10 @@ export async function extractPipeline(
         if (scores.length > 0) {
           currentStageAvgScore = parseFloat((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1));
         }
-        currentStageDate = new Date(currentInterviews[0].startTime).toISOString().split('T')[0];
+        const firstCurrentEvent = [...currentInterviews].sort((a, b) =>
+          new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
+        )[0];
+        currentStageDate = new Date(firstCurrentEvent.startTime).toISOString().split('T')[0];
       }
 
       if (previousInterviews.length > 0) {
@@ -404,6 +445,8 @@ export async function extractPipeline(
           interview_title: ev.interviewTitle,
           start_time: ev.startTime,
           end_time: ev.endTime,
+          interview_stage_id: ev.interviewStageId || null,
+          interview_stage_title: ev.interviewStageTitle || null,
           interviewers: ev.interviewers.map(i => ({
             name: i.name,
             email: i.email,
