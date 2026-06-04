@@ -21,6 +21,7 @@
  * API calls are needed. Data is extracted during normalizePipelineData().
  */
 import fetch from 'cross-fetch';
+import type { APIResponse } from 'playwright';
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
 
 export interface RawPipelineRow {
@@ -59,17 +60,111 @@ function withTimeout(ms: number): AbortSignal {
   return controller.signal;
 }
 
+/**
+ * Lowest-common-denominator response surface used by client.ts. Lets
+ * doFetch() return one shape regardless of transport (cross-fetch
+ * Response vs Playwright APIResponse).
+ */
+export interface UnifiedResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: { get(name: string): string | null };
+  json(): Promise<any>;
+  text(): Promise<string>;
+}
+
+function adaptPlaywrightResponse(res: APIResponse): UnifiedResponse {
+  // Playwright returns headers as a Record<string,string>, lowercased.
+  const headersMap = res.headers();
+  return {
+    ok: res.ok(),
+    status: res.status(),
+    statusText: res.statusText() || '',
+    headers: {
+      get(name: string): string | null {
+        return headersMap[name.toLowerCase()] ?? null;
+      },
+    },
+    json: () => res.json(),
+    text: () => res.text(),
+  };
+}
+
+function adaptNodeResponse(res: Response): UnifiedResponse {
+  return {
+    ok: res.ok,
+    status: res.status,
+    statusText: res.statusText || '',
+    headers: { get: (name: string) => res.headers.get(name) },
+    json: () => res.json(),
+    text: () => res.text(),
+  };
+}
+
+/**
+ * Single transport-aware HTTP entry point for the Ashby client.
+ *
+ * Two modes, picked by `session.requestContext`:
+ *
+ *   - **Live mode** (`requestContext` set, by server.ts liveContext): route
+ *     through Playwright's APIRequestContext, which inherits cookies from
+ *     the live BrowserContext the user did SSO in. Ashby keeps the session
+ *     fresh because every call comes "from" the browser it knows.
+ *
+ *   - **Legacy mode** (no `requestContext`): cookie header from the
+ *     in-memory `session.cookies` map + cross-fetch. Same behavior the
+ *     CLI / cookie-paste path has always had.
+ *
+ * Caller passes only resource-specific headers (content-type, etc.).
+ * doFetch handles auth (cookie OR live context) + csrf + timeout.
+ */
+async function doFetch(
+  session: AshbySession,
+  url: string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string }
+): Promise<UnifiedResponse> {
+  const callerHeaders: Record<string, string> = { ...(init?.headers || {}) };
+  if (!callerHeaders.accept) callerHeaders.accept = 'application/json';
+  if (session.csrfToken && !callerHeaders['x-csrf-token']) {
+    callerHeaders['x-csrf-token'] = session.csrfToken;
+  }
+
+  if (session.requestContext) {
+    const res = await session.requestContext.fetch(url, {
+      method: init?.method || 'GET',
+      headers: callerHeaders,
+      data: init?.body,
+      timeout: REQUEST_TIMEOUT_MS,
+      failOnStatusCode: false,
+    });
+    return adaptPlaywrightResponse(res);
+  }
+
+  // Legacy: cookies from session.cookies map.
+  const cookieHeader = Object.entries(session.cookies)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+  const headers: Record<string, string> = { cookie: cookieHeader, ...callerHeaders };
+  const res = await fetch(url, {
+    method: init?.method || 'GET',
+    headers,
+    body: init?.body,
+    signal: withTimeout(REQUEST_TIMEOUT_MS),
+  });
+  return adaptNodeResponse(res);
+}
+
 export async function fetchWithSession(
   session: AshbySession,
   url: string,
   init?: RequestInit
 ): Promise<unknown> {
-  const headers = {
-    ...createAuthHeaders(session),
-    ...(init?.headers as Record<string, string> | undefined)
-  };
-
-  const res = await fetch(url, { ...init, headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
+  const res = await doFetch(session, url, {
+    method: (init?.method as string | undefined),
+    headers: init?.headers as Record<string, string> | undefined,
+    body: typeof init?.body === 'string' ? init.body : undefined,
+  });
   if (!res.ok) {
     throw new Error(`Request failed ${res.status} ${res.statusText} for ${url}`);
   }
@@ -206,19 +301,19 @@ interface ApplicationsResponse {
 
 async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<string> {
   const url = 'https://app.ashbyhq.com/api/csrf/token';
-  const headers = createAuthHeaders(session);
-  
-  // Debug: Check if we have the critical auth cookie
-  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+
+  // Auth check only applies to the cookie-header path. The live
+  // BrowserContext path carries cookies in the browser jar — they may not
+  // be mirrored into session.cookies and we shouldn't refuse a live call
+  // just because session.cookies happens to be empty.
+  if (!session.requestContext &&
+      !session.cookies['ashby_session_token'] &&
+      !session.cookies['authenticated']) {
     throw new Error('Missing authentication cookies. Please run "auth" or "auth-cookie" to refresh your session.');
   }
-  
+
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers,
-      signal: withTimeout(REQUEST_TIMEOUT_MS),
-    });
+    const res = await doFetch(session, url, { method: 'GET' });
 
     if (res.ok) {
       const response = await res.json() as { token: string };
@@ -228,11 +323,16 @@ async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<strin
     // If 401, the session might be invalid - don't retry
     if (res.status === 401) {
       const errorText = await res.text();
-      // Check if cookies are present
+      // Adapt the message to whichever transport we're using.
       const hasAuthCookie = session.cookies['ashby_session_token'] || session.cookies['authenticated'];
-      const errorMsg = hasAuthCookie 
-        ? `Session appears expired. Please refresh your cookies by running 'auth-cookie' again with fresh cookies from your browser.`
-        : `Missing authentication cookies. Please run 'auth' or 'auth-cookie' to set up your session.`;
+      let errorMsg: string;
+      if (session.requestContext) {
+        errorMsg = 'Live browser session no longer authenticated. Re-run Log into Ashby.';
+      } else if (hasAuthCookie) {
+        errorMsg = "Session appears expired. Please refresh your cookies by running 'auth-cookie' again with fresh cookies from your browser.";
+      } else {
+        errorMsg = "Missing authentication cookies. Please run 'auth' or 'auth-cookie' to set up your session.";
+      }
       throw new Error(`Failed to fetch CSRF token: ${res.status} ${res.statusText}. ${errorMsg}`);
     }
 
@@ -272,23 +372,16 @@ async function graphqlQuery<T>(
   const url = `https://app.ashbyhq.com/api/graphql?op=${operationName}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const headers = createAuthHeaders(session);
-    headers['content-type'] = 'application/json';
-    if (session.csrfToken) {
-      headers['x-csrf-token'] = session.csrfToken;
-    }
-
     const body = JSON.stringify({
       operationName,
       query,
       variables
     });
 
-    const res = await fetch(url, {
+    const res = await doFetch(session, url, {
       method: 'POST',
-      headers,
+      headers: { 'content-type': 'application/json' },
       body,
-      signal: withTimeout(REQUEST_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -388,21 +481,20 @@ export async function fetchAvailableOrgs(session: AshbySession): Promise<OrgInfo
 async function switchOrgContext(session: AshbySession, userId: string): Promise<void> {
   const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
 
-  // Use existing CSRF for the switch POST — no need to fetch a fresh one
-  const headers = createAuthHeaders(session);
-  if (session.csrfToken) {
-    headers['x-csrf-token'] = session.csrfToken;
-  }
-  headers['content-type'] = 'application/json';
-
-  const res = await fetch(url, { method: 'POST', headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
+  const res = await doFetch(session, url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  });
 
   if (!res.ok) {
     const errorText = await res.text();
     throw new Error(`Failed to switch org context: ${res.status} ${res.statusText}. Response: ${errorText.substring(0, 200)}`);
   }
 
-  // Update cookies from response headers (if any)
+  // Mirror any Set-Cookie updates into the in-memory session cookies.
+  // In live mode this is mostly bookkeeping — the BrowserContext jar
+  // already has the new cookies. In legacy mode it's how we follow the
+  // org switch's session updates so subsequent calls are valid.
   const setCookieHeaders = res.headers.get('set-cookie');
   if (setCookieHeaders) {
     const cookies = setCookieHeaders.split(',').map(c => c.trim());
@@ -450,14 +542,7 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   
   // Fetch all available identities (orgs) the user can access
   const url = 'https://app.ashbyhq.com/api/auth/available_identities';
-  const headers = createAuthHeaders(session);
-  headers['x-csrf-token'] = csrfToken;
-
-  const res = await fetch(url, {
-    method: 'GET',
-    headers,
-    signal: withTimeout(REQUEST_TIMEOUT_MS),
-  });
+  const res = await doFetch(session, url, { method: 'GET' });
 
   if (!res.ok) {
     console.warn(`Could not fetch available identities: ${res.status} ${res.statusText}`);

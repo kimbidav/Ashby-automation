@@ -16,6 +16,8 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
+import path from 'node:path';
+import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
 import { loadSession } from './session.js';
 import { AshbySession } from './types.js';
@@ -101,6 +103,60 @@ if (STORED_COOKIE) {
   console.log('ASHBY_SESSION_COOKIE is set — extraction will use the stored session (no cookie paste needed)');
 }
 
+// ── Live SSO browser (Phase 2 architecture) ───────────────────────────────
+//
+// When `liveContext` is set, /api/extract routes every Ashby HTTP call
+// through Playwright's APIRequestContext, which sources cookies from the
+// live browser jar the user did SSO in. That dodges Ashby's
+// "the browser that authenticated quit, who are you?" invalidation —
+// the SSO browser stays open as long as the user wants, and refresh
+// calls work for as long as the browser stays alive.
+//
+// Lifecycle:
+//   POST /api/auth/start → launches headed Chromium, loads ashbyhq signin,
+//                          stores the BrowserContext here.
+//   GET  /api/auth/status → probes the context's cookies / identity endpoint.
+//   POST /api/auth/stop  → closes the context, clears this handle.
+//   On context.on('close') (user Cmd-Q'd Chromium), clear the handle too.
+
+let liveContext: BrowserContext | null = null;
+let liveContextStartedAt: string | null = null;
+
+const PROFILE_DIR = path.resolve(
+  process.env.PLAYWRIGHT_PROFILE_DIR || '.playwright-browser-data',
+);
+
+async function probeLiveAuth(ctx: BrowserContext): Promise<{ ok: boolean; reason?: string; csrfToken?: string }> {
+  // Cheap endpoint that requires an authenticated session — the CSRF token
+  // endpoint returns 200 + a token when the cookie jar is valid, 401 when not.
+  try {
+    const res = await ctx.request.fetch('https://app.ashbyhq.com/api/csrf/token', {
+      method: 'GET',
+      timeout: 8000,
+      failOnStatusCode: false,
+    });
+    if (res.ok()) {
+      const body = await res.json().catch(() => ({}));
+      return { ok: true, csrfToken: body?.token };
+    }
+    return { ok: false, reason: `auth probe returned ${res.status()}` };
+  } catch (err: any) {
+    return { ok: false, reason: err?.message || 'probe error' };
+  }
+}
+
+function liveSessionFromContext(ctx: BrowserContext, csrfToken?: string): AshbySession {
+  // Build an AshbySession whose `requestContext` triggers client.ts's live
+  // mode. cookies map is empty — doFetch routes around it in live mode, and
+  // the CSRF token hint lets the first call skip a roundtrip.
+  return {
+    cookies: {},
+    csrfToken,
+    orgIds: [],
+    requestContext: ctx.request,
+  };
+}
+
 // ── Cookie validation helper ──────────────────────────────────────────────
 
 /**
@@ -114,10 +170,13 @@ if (STORED_COOKIE) {
  *      transparently picks it up without any cookie wrangling on the caller.
  */
 async function validateCookie(cookie: unknown): Promise<{ session: AshbySession } | { error: string; status: number }> {
-  const raw = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : STORED_COOKIE;
+  const bodyCookie = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : '';
 
-  if (raw) {
-    const session = createSessionFromCookie(raw);
+  // 1. Explicit body cookie — back-compat for legacy clients that still
+  // paste a token. Wins over all other sources; the caller knew what
+  // they wanted.
+  if (bodyCookie) {
+    const session = createSessionFromCookie(bodyCookie);
     if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
       return {
         error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
@@ -127,24 +186,136 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
     return { session };
   }
 
-  // No cookie supplied — fall through to the persistent browser session.
+  // 2. Live SSO browser. The user kept Chromium open from /api/auth/start;
+  // we route through its APIRequestContext so cookies stay fresh.
+  if (liveContext) {
+    const probe = await probeLiveAuth(liveContext);
+    if (probe.ok) {
+      return { session: liveSessionFromContext(liveContext, probe.csrfToken) };
+    }
+    console.warn(`[live-auth] liveContext present but probe failed: ${probe.reason}`);
+    // Don't bail with 401 yet — STORED_COOKIE / persistent-file paths
+    // may still authenticate via the legacy transport.
+  }
+
+  // 3. STORED_COOKIE env var (legacy Railway deploy).
+  if (STORED_COOKIE) {
+    const stored = createSessionFromCookie(STORED_COOKIE);
+    if (stored.cookies['ashby_session_token'] || stored.cookies['authenticated']) {
+      return { session: stored };
+    }
+  }
+
+  // 4. .ashby-session.json / .playwright-browser-data (the cookie-paste
+  // and persistent-profile fallbacks). loadSession knows the right order.
   try {
     const session = await loadSession();
     if (session?.cookies?.['ashby_session_token'] || session?.cookies?.['authenticated']) {
       return { session };
     }
   } catch {
-    // Persistent session unavailable — fall through to the 400 below.
+    // Persistent session unavailable — fall through to the 401 below.
   }
 
   return {
     // 401 (not 400): from the caller's perspective this is "no auth," which
     // is what the dashboard's session_dead branch keys off of to surface
     // the "Log into Ashby" recovery instructions.
-    error: "No Ashby session available. Run 'npm run start -- auth' to establish a persistent session, set ASHBY_SESSION_COOKIE, or pass a cookie in the request body.",
+    error: "No Ashby session available. Open Log into Ashby in the dashboard, or pass a cookie in the request body.",
     status: 401,
   };
 }
+
+// ── Live-auth endpoints ─────────────────────────────────────────────────
+
+app.post('/api/auth/start', async (_req: express.Request, res: express.Response) => {
+  if (liveContext) {
+    // Already up. Return current status instead of double-launching.
+    const probe = await probeLiveAuth(liveContext);
+    res.json({
+      already_running: true,
+      authenticated: probe.ok,
+      reason: probe.reason,
+      started_at: liveContextStartedAt,
+    });
+    return;
+  }
+
+  try {
+    // Launch the persistent context HEADED so the user can do SSO. The
+    // context stays attached to this Node process; on close we clear the
+    // module-level handle so the next call sees a clean state.
+    const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+      headless: false,
+      viewport: { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+      ],
+    });
+    ctx.on('close', () => {
+      console.log('[live-auth] BrowserContext closed; clearing liveContext.');
+      liveContext = null;
+      liveContextStartedAt = null;
+    });
+
+    const page = ctx.pages()[0] || await ctx.newPage();
+    await page.goto('https://app.ashbyhq.com/signin', { waitUntil: 'domcontentloaded' }).catch((err) => {
+      console.warn('[live-auth] initial navigation warning:', err?.message);
+    });
+
+    liveContext = ctx;
+    liveContextStartedAt = new Date().toISOString();
+    console.log(`[live-auth] Chromium opened with profile ${PROFILE_DIR}. Awaiting SSO.`);
+
+    res.status(202).json({
+      started: true,
+      already_running: false,
+      profile_dir: PROFILE_DIR,
+      started_at: liveContextStartedAt,
+      message: 'Chromium is open at app.ashbyhq.com. Sign in, then leave the window open — refresh will work as long as Chromium is alive.',
+    });
+  } catch (err: any) {
+    console.error('[live-auth] failed to start:', err?.message);
+    res.status(500).json({ error: 'live_auth_start_failed', detail: err?.message });
+  }
+});
+
+app.get('/api/auth/status', async (_req: express.Request, res: express.Response) => {
+  if (!liveContext) {
+    res.json({
+      live_active: false,
+      authenticated: false,
+      reason: 'No live browser context. Call POST /api/auth/start to open one.',
+    });
+    return;
+  }
+  const probe = await probeLiveAuth(liveContext);
+  res.json({
+    live_active: true,
+    authenticated: probe.ok,
+    reason: probe.reason,
+    started_at: liveContextStartedAt,
+  });
+});
+
+app.post('/api/auth/stop', async (_req: express.Request, res: express.Response) => {
+  if (!liveContext) {
+    res.json({ live_active: false, closed: false });
+    return;
+  }
+  try {
+    const ctx = liveContext;
+    liveContext = null;
+    liveContextStartedAt = null;
+    await ctx.close().catch(() => {});
+    res.json({ live_active: false, closed: true });
+  } catch (err: any) {
+    res.status(500).json({ error: 'live_auth_stop_failed', detail: err?.message });
+  }
+});
 
 function formatResult(data: ExtractResult & { extraction_stats?: Record<string, unknown> }): CachedResult['data'] & { extraction_stats?: Record<string, unknown> } {
   return {
