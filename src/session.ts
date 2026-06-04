@@ -107,13 +107,14 @@ export async function loadSessionFromBrowserContext(): Promise<AshbySession | nu
     return null; // Browser context doesn't exist
   }
 
-  // Try to load the persistent browser context
-  // If it's locked (browser still open), we'll catch the error and use session file
+  // Try to load the persistent browser context (headless cookie reader)
+  // If it's locked (browser still open), we'll catch the error and use session file.
+  // Match the browser used by bootstrapSession() — Playwright's bundled
+  // Chromium — so the cookie jar Playwright reads is the one it wrote.
   let context;
   try {
     context = await chromium.launchPersistentContext(userDataDir, {
-      headless: true, // Headless is fine, we just need cookies
-      channel: 'chrome',
+      headless: true,
       args: ['--disable-blink-features=AutomationControlled']
     });
   } catch (error: any) {
@@ -209,9 +210,14 @@ export async function bootstrapSession(): Promise<AshbySession> {
     }
   }
   
+  // Use Playwright's bundled Chromium (NOT the system Chrome channel). On
+  // macOS, launching /Applications/Google Chrome.app via channel:'chrome'
+  // collides with any Chrome window the user already has open — the second
+  // launch gets swallowed by the existing Chrome.app process and no SSO
+  // window appears. Chromium has its own app bundle / dock entry, so it
+  // can't collide; the window is unambiguously visible.
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
-    channel: 'chrome', // Use system Chrome if available, otherwise Chromium
     args: [
       '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
