@@ -270,16 +270,68 @@ app.post('/api/auth/start', async (_req: express.Request, res: express.Response)
     // Launch the persistent context HEADED so the user can do SSO. The
     // context stays attached to this Node process; on close we clear the
     // module-level handle so the next call sees a clean state.
+    //
+    // Anti-automation-detection setup. Google's sign-in flow checks for
+    // several Playwright telltales and refuses auth if it sees them. We:
+    //   1) Drop Playwright's default --enable-automation flag (otherwise
+    //      Chrome shows "Chrome is being controlled by automated test
+    //      software" and exposes the `chrome.app` / automation markers).
+    //   2) Drop --use-mock-keychain so the OS keychain works for password
+    //      autofill (Google checks).
+    //   3) Add an init script that overrides navigator.webdriver and a few
+    //      other common detection points BEFORE any page script runs.
     const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless: false,
       viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      ignoreDefaultArgs: [
+        '--enable-automation',
+        '--use-mock-keychain',
+      ],
       args: [
         '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
         '--no-sandbox',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
+        '--password-store=basic',
       ],
     });
+
+    // Run BEFORE every page's scripts. Suppresses the most common
+    // navigator.webdriver detection used by Google sign-in.
+    await ctx.addInitScript(() => {
+      // navigator.webdriver === true is the canonical automation signal.
+      try {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+      } catch {/* already overridden */}
+      // navigator.languages is empty in headless; Google flags that.
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
+          configurable: true,
+        });
+      } catch {/* ignore */}
+      // navigator.plugins is empty in automation; real Chrome has at
+      // least the PDF viewer. Spoof a non-zero length.
+      try {
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5],
+          configurable: true,
+        });
+      } catch {/* ignore */}
+      // chrome.runtime is missing under automation; Google checks for it.
+      try {
+        if (!(window as any).chrome) (window as any).chrome = {};
+        if (!(window as any).chrome.runtime) (window as any).chrome.runtime = {};
+      } catch {/* ignore */}
+    });
+
     ctx.on('close', () => {
       console.log('[live-auth] BrowserContext closed; clearing liveContext.');
       liveContext = null;
