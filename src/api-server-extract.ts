@@ -309,11 +309,17 @@ export async function extractPipeline(
       };
       try {
         onProgress?.(orgsWithUserId.length, orgsWithUserId.length, 'Enriching scheduled candidates...');
+        // Concurrency is only safe in live mode, where the browser context's
+        // cookie jar absorbs token rotation server-side. In legacy cookie
+        // mode, N in-flight requests share one rotating token: the first
+        // response invalidates it, the rest 401, and Ashby revokes the whole
+        // session chain. Sequential keeps exactly one token in flight.
+        const enrichConcurrency = session.requestContext ? 5 : 1;
         allCandidates = await enrichCandidatesWithDetails(
           session,
           allCandidates,
           orgsWithUserId,
-          { maxConcurrent: 5, shouldEnrich, deadlineMs: budgetForEnrich },
+          { maxConcurrent: enrichConcurrency, shouldEnrich, deadlineMs: budgetForEnrich },
         );
       } catch (err: any) {
         console.warn(`⚠️  Enrichment pass failed (non-fatal): ${err?.message?.substring(0, 150)}`);

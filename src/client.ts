@@ -216,9 +216,12 @@ async function doFetch(
   // switches — mirror every rotation so the next request stays authenticated,
   // and let the owner persist the new map (server.ts writes it to
   // .ashby-session.json so the rotation chain survives across runs).
+  // Only successful responses advance the chain: a 401's Set-Cookie clears
+  // the token, and mirroring that would wipe a jar that a concurrent
+  // response may have just validly rotated.
   // Note: node-fetch follows redirects and drops intermediate Set-Cookie
   // headers; fine here, the GraphQL/JSON endpoints never redirect.
-  if (mirrorSetCookies(session, extractSetCookies(res))) {
+  if (res.ok && mirrorSetCookies(session, extractSetCookies(res))) {
     session.onCookiesRotated?.(session);
   }
 
