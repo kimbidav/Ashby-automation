@@ -567,8 +567,13 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
   // Set-Cookie mirroring happens centrally in doFetch — the org switch's
   // session updates are already in session.cookies by the time we get here.
 
-  // Don't refresh CSRF here — the token is session-scoped, not org-scoped.
-  // graphqlQuery retries with a fresh CSRF on 403, so stale tokens self-heal.
+  // The CSRF token is IDENTITY-scoped and change_user switches identity, so
+  // the old token is invalid from this point on. Refresh it eagerly: Ashby
+  // answers a stale-CSRF GraphQL call with 401 (not the 403 graphqlQuery's
+  // self-heal listens for) and revokes the whole session chain — observed
+  // live when the enrichment pass queried right after a switch without
+  // refreshing, killing every subsequent request in the run.
+  session.csrfToken = await fetchCsrfToken(session);
 }
 
 interface AvailableIdentityResponse {
