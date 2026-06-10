@@ -31,6 +31,8 @@ export interface ExtractedCandidate {
   job_id: string;
   candidate_name: string;
   candidate_id: string;
+  application_id: string;
+  org_id: string;
   pipeline_stage: string;
   decision_status: string;
   stage_type: string;
@@ -443,6 +445,10 @@ export async function extractPipeline(
       job_id: cand.jobId,
       candidate_name: cand.name,
       candidate_id: cand.id,
+      // Identity for targeted lookups after the candidate leaves the active
+      // pipeline (archived/hired verification needs the application + org).
+      application_id: cand.applicationId ?? '',
+      org_id: cand.orgId ?? '',
       pipeline_stage: cand.pipelineStage ?? '',
       decision_status: cand.decisionStatus ?? '',
       stage_type: cand.stageType ?? '',

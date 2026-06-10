@@ -27,6 +27,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
+import { fetchArchiveStatuses } from './client.js';
 import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
@@ -462,6 +463,32 @@ function handleExtractionError(err: any, res: express.Response) {
   console.error('Extraction error:', message);
   res.status(500).json({ error: 'Extraction failed.', detail: message });
 }
+
+// ── Archive-status verification ──────────────────────────────────────────
+//
+// When a previously-active candidate stops appearing in the sweep, the
+// dashboard backend asks here WHY: Hired is a placement, Did Not Respond is
+// a dead process. Body: { applications: [{application_id, org_id}], cookie? }
+// Sequential per-application lookups in the owning org's context.
+
+app.post('/api/applications/archive-status', async (req: express.Request, res: express.Response) => {
+  const validation = await validateCookie(req.body?.cookie);
+  if ('error' in validation) {
+    res.status(validation.status).json({ error: validation.error });
+    return;
+  }
+  const applications = Array.isArray(req.body?.applications) ? req.body.applications : [];
+  if (applications.length === 0) {
+    res.json({ results: [] });
+    return;
+  }
+  try {
+    const results = await fetchArchiveStatuses(validation.session, applications.slice(0, 50));
+    res.json({ results });
+  } catch (err: any) {
+    handleExtractionError(err, res);
+  }
+});
 
 // ── Synchronous extraction ───────────────────────────────────────────────
 

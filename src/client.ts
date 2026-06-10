@@ -1575,6 +1575,7 @@ export async function fetchApplicationDetails(
   currentInterviewStage: any;
   interviewPlan: any;
   job: any;
+  archiveReason: any;
 } | null> {
   try {
     // Load the ApiApplication query from file
@@ -1683,12 +1684,79 @@ export async function fetchApplicationDetails(
       applicationStatus: response.application.applicationStatus,
       currentInterviewStage: response.application.currentInterviewStage || null,
       interviewPlan: response.application.interviewPlan || null,
-      job: response.application.job || null
+      job: response.application.job || null,
+      // The query requests archiveReason (ArchiveReasonAdminParts) — surface
+      // it so callers can distinguish Hired from other archive outcomes.
+      archiveReason: (response.application as any).archiveReason || null,
     };
   } catch (error) {
     console.error(`  Error fetching application details for ${applicationId}:`, error);
     return null;
   }
+}
+
+export interface ArchiveStatusResult {
+  application_id: string;
+  found: boolean;
+  is_archived: boolean;
+  archive_reason_text: string | null;
+  archive_reason_type: string | null;
+  status_description: string | null;
+}
+
+/**
+ * Resolve the archive status of specific applications — used when a
+ * candidate disappears from the active-pipeline sweep and the caller needs
+ * to know WHY (Hired is a very different outcome from Did Not Respond).
+ * Groups by org (each lookup must run in the owning org's context) and
+ * fetches sequentially — safe for legacy cookie sessions under rotation.
+ */
+export async function fetchArchiveStatuses(
+  session: AshbySession,
+  applications: Array<{ application_id: string; org_id: string }>,
+): Promise<ArchiveStatusResult[]> {
+  const orgs = await fetchAllAvailableOrgs(session);
+  const userIdByOrg = new Map(orgs.map((o) => [o.id, o.userId]));
+
+  const byOrg = new Map<string, string[]>();
+  for (const app of applications) {
+    if (!app?.application_id || !app?.org_id) continue;
+    if (!byOrg.has(app.org_id)) byOrg.set(app.org_id, []);
+    byOrg.get(app.org_id)!.push(app.application_id);
+  }
+
+  const results: ArchiveStatusResult[] = [];
+  for (const [orgId, appIds] of byOrg.entries()) {
+    const userId = userIdByOrg.get(orgId);
+    if (!userId) {
+      for (const id of appIds) {
+        results.push({ application_id: id, found: false, is_archived: false, archive_reason_text: null, archive_reason_type: null, status_description: null });
+      }
+      continue;
+    }
+    try {
+      await switchOrgContext(session, userId);
+    } catch (err: any) {
+      console.warn(`  archive-status: failed to switch to org ${orgId}: ${err?.message}`);
+      for (const id of appIds) {
+        results.push({ application_id: id, found: false, is_archived: false, archive_reason_text: null, archive_reason_type: null, status_description: null });
+      }
+      continue;
+    }
+    for (const id of appIds) {
+      const details = await fetchApplicationDetails(session, id);
+      const reason = details?.archiveReason;
+      results.push({
+        application_id: id,
+        found: !!details,
+        is_archived: !!reason,
+        archive_reason_text: reason?.text ?? null,
+        archive_reason_type: reason?.builtInId ?? reason?.reasonType ?? null,
+        status_description: details?.applicationStatus?.description ?? null,
+      });
+    }
+  }
+  return results;
 }
 
 /**
