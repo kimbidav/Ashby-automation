@@ -140,7 +140,7 @@ npm run start -- auth-cookie --cookie "paste_token_here"
 
 The cookie value is the `ashby_session_token` from Chrome DevTools > Application > Cookies > `app.ashbyhq.com`.
 
-**Extraction time budget**: one run is time-boxed by `ASHBY_EXTRACT_BUDGET_SEC` (default 240). Callers waiting synchronously (the dashboard backend's `ASHBY_REFRESH_TIMEOUT_SEC`) must allow this plus ~60s of slack.
+**Extraction time budget**: one run is time-boxed by `ASHBY_EXTRACT_BUDGET_SEC` (code default 240; `npm run server` / `npm run server:prod` pin 720 unless the env var is already set, so the targeted enrichment pass still runs even when a slow Ashby day pushes the org sweep past 10 minutes). Callers waiting synchronously (the dashboard backend's `ASHBY_REFRESH_TIMEOUT_SEC`) must allow this plus ~60s of slack.
 
 ## Feedback Text Extraction
 

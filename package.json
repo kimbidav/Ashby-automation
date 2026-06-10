@@ -9,8 +9,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node --loader ts-node/esm src/cli.ts",
-    "server": "node --loader ts-node/esm src/server.ts",
-    "server:prod": "node dist/server.js"
+    "server": "ASHBY_EXTRACT_BUDGET_SEC=\"${ASHBY_EXTRACT_BUDGET_SEC:-720}\" node --loader ts-node/esm src/server.ts",
+    "server:prod": "ASHBY_EXTRACT_BUDGET_SEC=\"${ASHBY_EXTRACT_BUDGET_SEC:-720}\" node dist/server.js"
   },
   "keywords": [
     "ashby",
