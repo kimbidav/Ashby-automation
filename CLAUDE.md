@@ -42,17 +42,17 @@ server.ts (Express API)
 
 Ashby uses a **server-side session**. The `ashby_session_token` cookie maps to server state. Calling `change_user` switches the org context globally for that session — you cannot process multiple orgs in parallel with one session.
 
-### How Enrichment Works (Inline, No Separate Phase)
+### How Enrichment Works (Inline Bulk + Targeted Pass)
 
-Previously, enrichment required a separate `ApiApplication` GraphQL call per candidate. Now, the `applicationsByPrebuiltView` query includes all enrichment fields inline:
+Most enrichment arrives inline: the `applicationsByPrebuiltView` query includes the enrichment fields in bulk:
 
 - `interviewEvents` with full interviewer + scorecard data
 - `interviewPlan` with stage definitions
 - `job.interviewPlansWithActivities` for fallback stage ordering
 
-This data is extracted during `normalizePipelineData()` in `client.ts`. There is **no separate enrichment phase**.
+This data is extracted during `normalizePipelineData()` in `client.ts`.
 
-The old `enrichCandidatesWithDetails()` function still exists in `client.ts` but is no longer called from either orchestration path.
+On top of that, `extractPipeline()` runs a **targeted enrichment pass** (`enrichCandidatesWithDetails()` in `client.ts`) for suspect candidates — status "Scheduled"/"Waiting on…", or active candidates whose bulk row has zero interview events (the bulk view lags newly-moved stages). It re-fetches full application details per candidate, time-boxed by `ASHBY_ENRICH_MIN_BUDGET_SEC` (default 180s; raise for a one-off catch-up). In legacy cookie mode it runs sequentially (one token in flight — see Session Management); in live-browser mode it runs 5-wide. Candidates left unenriched when the deadline hits keep their bulk data and are picked up by future runs (the dashboard backend merges per candidate, so enrichment accumulates).
 
 ### Error Recovery: Retry + Fallback
 
@@ -91,7 +91,7 @@ The fallback query still includes: candidate info, job/stage data, interview eve
 - `normalizePipelineData(jobs, applications, orgId, orgName)` — converts raw GraphQL data to `Candidate[]` with inline enrichment
 - `graphqlQuery<T>(session, operationName, query, variables, forceRefreshCsrf, retries)` — low-level GraphQL executor with automatic retry for transient server errors
 - `extractFeedbackText(submittedFormRender)` — parses scorecard form data to extract feedback text
-- `enrichCandidatesWithDetails(session, candidates, orgInfos, options)` — **legacy**, no longer called
+- `enrichCandidatesWithDetails(session, candidates, orgInfos, options)` — targeted per-application enrichment pass, called by `extractPipeline()` after the sweep for suspect candidates (time-boxed; sequential in legacy cookie mode)
 
 ## GraphQL Queries Used
 
@@ -206,7 +206,7 @@ The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `
 
 ## Future Performance Optimizations
 
-Currently the extraction processes all ~60 orgs sequentially (~2 min total). Parallelization is blocked by Ashby's server-side session (one org context at a time per token). Planned improvements:
+Currently the extraction processes all ~70 orgs sequentially (~2 min on a good day; ~10–15 min observed when Ashby is slow and per-request 15s timeouts trigger retries). Parallelization is blocked by Ashby's server-side session (one org context at a time per token). Planned improvements:
 
 - **Lazy enrichment**: Serve simple query results immediately, fetch scorecard/feedback on-demand per candidate via the existing `ApiApplication` query in `fetchApplicationDetails()`
 - **Skip empty orgs**: Check `jobsPipelines.applicationCount` first, skip orgs with 0 candidates (~20 orgs currently)

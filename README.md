@@ -15,9 +15,9 @@ This project is a **read-only control plane** for Ashby that aggregates **in-pro
 
 - **Read-Only**: No data modification, only extraction
 - **Multi-Org Support**: Automatically discovers and aggregates data across all accessible organizations
-- **Single Session**: Authenticate once, access all orgs
+- **Single Session**: Authenticate once, access all orgs. Ashby rotates the session token every few minutes; every rotation is mirrored mid-run and persisted back to `.ashby-session.json`, so one login lasts until Ashby's hard ~7-day expiry
 - **Structured Output**: CSV and JSON exports with timestamped filenames
-- **Inline Enrichment**: Interview events, scorecard feedback, and stage progress fetched in bulk — no per-candidate API calls
+- **Inline Enrichment**: Interview events, scorecard feedback, and stage progress fetched in bulk, plus a time-boxed targeted pass that re-fetches full details for candidates whose bulk data lags (newly scheduled stages)
 - **Resilient Extraction**: Automatic retry with exponential backoff for transient Ashby server errors, plus fallback to simplified queries for orgs where the full enrichment query is too heavy
 - **API Server**: Express server with `POST /api/extract` for the [Lovable dashboard frontend](https://github.com/kimbidav/ashbypipeline)
 - **Google Calendar Sync**: Batch-add interview events to Google Calendar via OAuth
@@ -64,14 +64,14 @@ The recommended way to authenticate is to use your existing Ashby session from G
 1. Log in to Ashby normally in Google Chrome at `app.ashbyhq.com`
 2. Open Chrome DevTools (F12 or Cmd+Option+I)
 3. Go to **Application** → **Cookies** → `https://app.ashbyhq.com`
-4. Find the session cookie (typically named `__session` or similar) and copy its value
+4. Find the `ashby_session_token` cookie and copy its value
 5. Run the auth command with your cookie:
 
 ```bash
 npm run start -- auth-cookie --cookie "your_cookie_value_here"
 ```
 
-This saves the session to `.ashby-session.json` for subsequent extractions.
+This saves the session to `.ashby-session.json` for subsequent extractions. Token rotations during extraction are persisted back to that file automatically, so a single paste keeps working until Ashby's hard login expiry (~7 days) — no need to re-paste between runs.
 
 **Alternative**: Browser-based authentication (may have issues with SSO):
 
