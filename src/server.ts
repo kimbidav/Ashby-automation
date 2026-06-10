@@ -11,7 +11,14 @@
  * Result cache: successful extractions are cached for 10 minutes.
  * Subsequent requests (even with a different/expired cookie) return the
  * cached result instantly, because the underlying Ashby data doesn't
- * change that fast and cookies rotate every few minutes.
+ * change that fast.
+ *
+ * Session rotation: Ashby rotates cookies every few minutes. In legacy
+ * (non-live-browser) mode, doFetch mirrors every Set-Cookie back into the
+ * session and validateCookie attaches a hook that persists the rotated map
+ * to .ashby-session.json — so one extraction completes without a mid-sweep
+ * 401 and later runs reuse the rotated chain until Ashby's ~7-day login
+ * expiry.
  */
 import express from 'express';
 import cors from 'cors';
@@ -20,7 +27,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
-import { loadSession } from './session.js';
+import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
@@ -173,9 +180,22 @@ function liveSessionFromContext(ctx: BrowserContext, csrfToken?: string): AshbyS
 async function validateCookie(cookie: unknown): Promise<{ session: AshbySession } | { error: string; status: number }> {
   const bodyCookie = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : '';
 
+  // Every legacy-transport session gets this hook: doFetch fires it whenever
+  // Ashby rotates a cookie via Set-Cookie, and persistSessionCookies writes
+  // the rotated map to .ashby-session.json. That keeps the on-disk session
+  // current across runs (Ashby rotates every few minutes — the login-day
+  // token alone goes stale almost immediately), so one extraction completes
+  // without a mid-sweep 401 and the next run reuses the rotated chain.
+  const attachPersistence = (session: AshbySession, seedHash?: string): AshbySession => {
+    if (seedHash) session.seedHash = seedHash;
+    session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+    return session;
+  };
+
   // 1. Explicit body cookie — back-compat for legacy clients that still
   // paste a token. Wins over all other sources; the caller knew what
-  // they wanted.
+  // they wanted. Persisting its rotations turns a one-time paste into a
+  // durable session the no-cookie path picks up on the next call.
   if (bodyCookie) {
     const session = createSessionFromCookie(bodyCookie);
     if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
@@ -184,11 +204,13 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
         status: 400,
       };
     }
-    return { session };
+    return { session: attachPersistence(session) };
   }
 
   // 2. Live SSO browser. The user kept Chromium open from /api/auth/start;
-  // we route through its APIRequestContext so cookies stay fresh.
+  // we route through its APIRequestContext so cookies stay fresh. No
+  // persistence hook — the live cookie map is empty by design and the
+  // Playwright profile owns those cookies.
   if (liveContext) {
     const probe = await probeLiveAuth(liveContext);
     if (probe.ok) {
@@ -199,11 +221,28 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
     // may still authenticate via the legacy transport.
   }
 
-  // 3. STORED_COOKIE env var (legacy Railway deploy).
+  // 3. STORED_COOKIE env var (legacy Railway deploy). The env value is
+  // frozen at deploy time while Ashby rotates the real token underneath it,
+  // so prefer the persisted session file when it descends from this same
+  // seed cookie (matching seedHash). A different seedHash means the operator
+  // deployed a fresh cookie — that wins, and its first rotation overwrites
+  // the file with the new chain.
   if (STORED_COOKIE) {
+    const seedHash = crypto.createHash('sha256').update(STORED_COOKIE).digest('hex');
+    try {
+      const persisted = await loadSession();
+      if (
+        persisted?.seedHash === seedHash &&
+        (persisted.cookies?.['ashby_session_token'] || persisted.cookies?.['authenticated'])
+      ) {
+        return { session: attachPersistence(persisted, seedHash) };
+      }
+    } catch {
+      // No persisted descendant — fall back to the raw env cookie.
+    }
     const stored = createSessionFromCookie(STORED_COOKIE);
     if (stored.cookies['ashby_session_token'] || stored.cookies['authenticated']) {
-      return { session: stored };
+      return { session: attachPersistence(stored, seedHash) };
     }
   }
 
@@ -212,7 +251,7 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
   try {
     const session = await loadSession();
     if (session?.cookies?.['ashby_session_token'] || session?.cookies?.['authenticated']) {
-      return { session };
+      return { session: attachPersistence(session, session.seedHash) };
     }
   } catch {
     // Persistent session unavailable — fall through to the 401 below.

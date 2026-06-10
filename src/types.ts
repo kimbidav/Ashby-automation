@@ -120,4 +120,17 @@ export interface AshbySession {
    * server.ts when login mode is "live."
    */
   requestContext?: APIRequestContext;
+  /**
+   * Invoked by doFetch whenever a Set-Cookie response rotated a cookie value
+   * in `cookies`. server.ts attaches a hook that persists the rotated map to
+   * .ashby-session.json so the session survives across runs. Never serialized.
+   */
+  onCookiesRotated?: (session: AshbySession) => void;
+  /**
+   * sha256 of the cookie string this session's rotation chain descends from
+   * (e.g. the STORED_COOKIE env var). Lets validateCookie tell whether a
+   * persisted session file is a rotation descendant of the configured seed
+   * cookie or predates it. Persisted alongside the cookie map.
+   */
+  seedHash?: string;
 }

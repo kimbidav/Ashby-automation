@@ -103,6 +103,65 @@ function adaptNodeResponse(res: Response): UnifiedResponse {
 }
 
 /**
+ * Pull individual Set-Cookie header values out of a fetch Response.
+ * cross-fetch resolves to node-fetch v2 here, whose Headers exposes the
+ * non-standard raw() returning string arrays; undici (and future runtimes)
+ * expose getSetCookie(). headers.get() is the last resort — it joins
+ * multiple Set-Cookie values with ", ", so split only on commas that start
+ * a new `name=` pair (an `Expires=Thu, 01 Jan...` comma doesn't match).
+ */
+function extractSetCookies(res: Response): string[] {
+  const h = res.headers as any;
+  if (typeof h.getSetCookie === 'function') return h.getSetCookie();
+  if (typeof h.raw === 'function') return h.raw()['set-cookie'] ?? [];
+  const joined = res.headers.get('set-cookie');
+  if (!joined) return [];
+  return joined.split(/,(?=\s*[a-zA-Z0-9!#$%&'*+\-.^_`|~]+=)/).map((c) => c.trim());
+}
+
+/**
+ * Mirror Set-Cookie values into the in-memory session cookie map. Ashby
+ * rotates ashby_session_token every few minutes; without this, the next
+ * request goes out with the pre-rotation token and 401s mid-extraction.
+ * Honors deletions (empty value / Max-Age=0 / past Expires). Returns true
+ * if any cookie actually changed, so the caller can persist the new map.
+ */
+function mirrorSetCookies(session: AshbySession, setCookies: string[]): boolean {
+  let changed = false;
+  for (const raw of setCookies) {
+    const segments = raw.split(';');
+    const nameValue = segments[0] ?? '';
+    const eqIndex = nameValue.indexOf('=');
+    if (eqIndex <= 0) continue;
+    const name = nameValue.slice(0, eqIndex).trim();
+    const value = nameValue.slice(eqIndex + 1).trim();
+    if (!name) continue;
+
+    let expired = value === '';
+    for (const seg of segments.slice(1)) {
+      const [attr, attrValue] = seg.split('=').map((s) => s?.trim());
+      const attrLower = (attr || '').toLowerCase();
+      if (attrLower === 'max-age' && Number(attrValue) <= 0) expired = true;
+      if (attrLower === 'expires' && attrValue) {
+        const ts = Date.parse(seg.slice(seg.indexOf('=') + 1).trim());
+        if (!Number.isNaN(ts) && ts < Date.now()) expired = true;
+      }
+    }
+
+    if (expired) {
+      if (name in session.cookies) {
+        delete session.cookies[name];
+        changed = true;
+      }
+    } else if (session.cookies[name] !== value) {
+      session.cookies[name] = value;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
  * Single transport-aware HTTP entry point for the Ashby client.
  *
  * Two modes, picked by `session.requestContext`:
@@ -152,6 +211,17 @@ async function doFetch(
     body: init?.body,
     signal: withTimeout(REQUEST_TIMEOUT_MS),
   });
+
+  // Ashby rotates session cookies on arbitrary responses, not just org
+  // switches — mirror every rotation so the next request stays authenticated,
+  // and let the owner persist the new map (server.ts writes it to
+  // .ashby-session.json so the rotation chain survives across runs).
+  // Note: node-fetch follows redirects and drops intermediate Set-Cookie
+  // headers; fine here, the GraphQL/JSON endpoints never redirect.
+  if (mirrorSetCookies(session, extractSetCookies(res))) {
+    session.onCookiesRotated?.(session);
+  }
+
   return adaptNodeResponse(res);
 }
 
@@ -491,21 +561,8 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
     throw new Error(`Failed to switch org context: ${res.status} ${res.statusText}. Response: ${errorText.substring(0, 200)}`);
   }
 
-  // Mirror any Set-Cookie updates into the in-memory session cookies.
-  // In live mode this is mostly bookkeeping — the BrowserContext jar
-  // already has the new cookies. In legacy mode it's how we follow the
-  // org switch's session updates so subsequent calls are valid.
-  const setCookieHeaders = res.headers.get('set-cookie');
-  if (setCookieHeaders) {
-    const cookies = setCookieHeaders.split(',').map(c => c.trim());
-    for (const cookie of cookies) {
-      const [nameValue] = cookie.split(';');
-      const [name, value] = nameValue.split('=');
-      if (name && value) {
-        session.cookies[name.trim()] = value.trim();
-      }
-    }
-  }
+  // Set-Cookie mirroring happens centrally in doFetch — the org switch's
+  // session updates are already in session.cookies by the time we get here.
 
   // Don't refresh CSRF here — the token is session-scoped, not org-scoped.
   // graphqlQuery retries with a fresh CSRF on 403, so stale tokens self-heal.

@@ -123,16 +123,24 @@ Sessions are stored in `.ashby-session.json` (gitignored). Format:
 {
   "cookies": { "ashby_session_token": "s%3A..." },
   "csrfToken": "...",
-  "orgIds": []
+  "orgIds": [],
+  "persistedAt": "2026-06-10T17:03:12.345Z",
+  "seedHash": "sha256-of-the-seed-cookie (only when seeded from STORED_COOKIE)"
 }
 ```
 
-Sessions expire after ~7 days. To refresh:
+**Rotation persistence**: Ashby rotates `ashby_session_token` via `Set-Cookie` every few minutes. `doFetch` (client.ts) mirrors every rotation into the in-memory session and fires `session.onCookiesRotated`; the server (`validateCookie`) and the CLI `extract` command wire that hook to `persistSessionCookies()` (session.ts), which atomically rewrites `.ashby-session.json` with the rotated map. So the file always holds the newest token in the chain, a single extraction run never 401s mid-sweep from rotation, and later runs reuse the persisted chain — no re-auth until Ashby's hard login expiry (~7 days) or an explicit logout. Live-SSO-browser sessions never persist (the Playwright profile owns those cookies).
+
+When `ASHBY_SESSION_COOKIE` (env) is set, `validateCookie` prefers the persisted file if its `seedHash` matches the env cookie's sha256 (the file is a rotation descendant of that deploy's cookie); a different hash means a fresh cookie was deployed and it wins.
+
+Sessions expire after ~7 days (hard login expiry). To refresh:
 ```bash
 npm run start -- auth-cookie --cookie "paste_token_here"
 ```
 
 The cookie value is the `ashby_session_token` from Chrome DevTools > Application > Cookies > `app.ashbyhq.com`.
+
+**Extraction time budget**: one run is time-boxed by `ASHBY_EXTRACT_BUDGET_SEC` (default 240). Callers waiting synchronously (the dashboard backend's `ASHBY_REFRESH_TIMEOUT_SEC`) must allow this plus ~60s of slack.
 
 ## Feedback Text Extraction
 
@@ -189,7 +197,7 @@ The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `
 
 ## Common Pitfalls
 
-- **Session invalidation**: The `switchOrgContext` function modifies `session.cookies` in-place (from `set-cookie` response headers). If the process crashes mid-extraction, the saved session file may have stale cookies.
+- **Session rotation**: `doFetch` mirrors every `Set-Cookie` into `session.cookies` in-place and (when the persistence hook is attached) immediately rewrites `.ashby-session.json`. A crash mid-extraction leaves the file holding the newest rotated token, so the next run resumes off a valid session.
 - **CSRF tokens**: Must be refreshed after every org switch. The token from before the switch is invalid for the new org context.
 - **`applicationsByPrebuiltView` fields**: This is an internal Ashby API. If Ashby changes the schema, the expanded query may fail. The fields we request (interviewEvents, interviewPlan, scorecardSubmission) are stable since they're used by the Ashby web UI itself.
 - **Transient server errors**: Ashby's API returns `"Unidentified server error"` for some orgs when the full enrichment query is too heavy. This is NOT a session/auth issue — it's server-side. The retry + fallback mechanism in `graphqlQuery()` and `fetchPipelineForOrg()` handles this automatically. Orgs with large datasets (many candidates/interviews) are most likely to trigger it.

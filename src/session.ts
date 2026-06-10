@@ -11,7 +11,12 @@
  *   1. .ashby-session.json (works even while the browser window is still open)
  *   2. Playwright persistent browser context at .playwright-browser-data/ (if browser is closed)
  *
- * Sessions expire when Ashby's cookies expire (~7 days for ashby_session_token).
+ * Ashby ROTATES ashby_session_token via Set-Cookie every few minutes.
+ * doFetch (client.ts) mirrors each rotation into the in-memory session and
+ * fires session.onCookiesRotated, which server.ts wires to
+ * persistSessionCookies() below — so `.ashby-session.json` always holds the
+ * newest token in the rotation chain, not the one from login day.
+ * Sessions only die at Ashby's hard login expiry (~7 days) or logout.
  * Re-auth: npm run start -- auth-cookie --cookie "<new cookie string>"
  */
 import { chromium, BrowserContext } from 'playwright';
@@ -20,6 +25,59 @@ import path from 'node:path';
 import { AshbySession } from './types.js';
 
 const SESSION_FILE = path.join(process.cwd(), '.ashby-session.json');
+
+// Serializes session-file writes so concurrent rotations can't interleave.
+let persistChain: Promise<void> = Promise.resolve();
+
+/**
+ * Persist the session's current cookie map to .ashby-session.json.
+ *
+ * Called (via session.onCookiesRotated) every time doFetch observes a
+ * Set-Cookie rotation, so the file on disk always holds the newest token in
+ * the rotation chain — the next run (or a run resumed after a crash) starts
+ * from a valid session instead of the login-day token Ashby already rotated
+ * out.
+ *
+ * Guards:
+ *  - Live mode (requestContext set) never persists — its cookie map is empty
+ *    by design; the Playwright profile owns those cookies.
+ *  - A map without auth cookies never persists — don't clobber a good file
+ *    with junk.
+ *
+ * Writes are atomic (tmp + rename) and serialized through `persistChain`.
+ * Failures are logged, never thrown — persistence must not fail extraction.
+ */
+export function persistSessionCookies(session: AshbySession): Promise<void> {
+  if (session.requestContext) return Promise.resolve();
+  if (!session.cookies?.['ashby_session_token'] && !session.cookies?.['authenticated']) {
+    return Promise.resolve();
+  }
+
+  // Snapshot now — the map may mutate again before the queued write runs.
+  const payload = JSON.stringify(
+    {
+      cookies: { ...session.cookies },
+      csrfToken: session.csrfToken,
+      orgIds: session.orgIds,
+      persistedAt: new Date().toISOString(),
+      ...(session.seedHash ? { seedHash: session.seedHash } : {}),
+    },
+    null,
+    2
+  );
+
+  persistChain = persistChain.then(async () => {
+    const tmpFile = `${SESSION_FILE}.tmp`;
+    try {
+      await fs.writeFile(tmpFile, payload, 'utf8');
+      await fs.rename(tmpFile, SESSION_FILE);
+      console.log('✓ Persisted rotated session cookies to .ashby-session.json');
+    } catch (err: any) {
+      console.warn(`⚠ Failed to persist rotated session cookies: ${err?.message || err}`);
+    }
+  });
+  return persistChain;
+}
 
 export async function saveSessionFromContext(context: BrowserContext): Promise<AshbySession> {
   const cookies = await context.cookies();
@@ -250,7 +308,7 @@ export async function bootstrapSession(): Promise<AshbySession> {
         const saved = await saveSessionFromContext(context);
         console.log('\n✅ Session saved successfully!');
         console.log('   You can now run: npm run start -- extract --json output.json --csv output.csv');
-        console.log('   (Run it soon - cookies expire after ~30-60 minutes)\n');
+        console.log('   (Token rotations are persisted automatically — the session lasts until Ashby\'s ~7-day login expiry)\n');
         resolve(saved);
       } catch (err) {
         reject(err);

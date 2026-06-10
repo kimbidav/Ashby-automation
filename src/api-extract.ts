@@ -15,7 +15,7 @@
  *   retries   — Retry count per org on failure
  *   orgFilter — Case-insensitive name filter to run on a single org
  */
-import { loadSession } from './session.js';
+import { loadSession, persistSessionCookies } from './session.js';
 import { fetchAllAvailableOrgs, fetchPipelineForOrg } from './client.js';
 import { exportJSON, exportCSV } from './export.js';
 import { Company, Job, Candidate } from './types.js';
@@ -52,6 +52,10 @@ export async function extractCommand(options: ExtractOptions): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  // Persist every Set-Cookie rotation so the session file stays current
+  // across CLI runs (same hook the server attaches in validateCookie).
+  session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
 
   console.log('✓ Session loaded\n');
 

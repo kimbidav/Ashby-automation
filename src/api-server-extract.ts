@@ -160,6 +160,11 @@ interface OrgCacheEntry {
 const orgCache = new Map<string, OrgCacheEntry>();
 const ORG_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes per org
 
+// Total wall-clock budget for one extraction run. Callers waiting on the
+// extract (the dashboard backend's ASHBY_REFRESH_TIMEOUT_SEC, default 300s)
+// must allow at least this much plus ~60s of flatten/restore/network slack.
+const EXTRACT_BUDGET_MS = parseInt(process.env.ASHBY_EXTRACT_BUDGET_SEC || '240', 10) * 1000;
+
 export function getOrgCacheStats() {
   let cachedOrgs = 0;
   let cachedCandidates = 0;
@@ -282,7 +287,7 @@ export async function extractPipeline(
     // Leave at least 90s for the rest of the pipeline (restore + flatten +
     // network return). Anything above 60s of remaining budget gets spent on
     // enrichment; below that we skip rather than risk timing out.
-    const budgetForEnrich = Math.max(0, 240_000 - elapsedSoFar - 90_000);
+    const budgetForEnrich = Math.max(0, EXTRACT_BUDGET_MS - elapsedSoFar - 90_000);
     if (budgetForEnrich >= 60_000) {
       const SUSPECT_STATUS = new Set([
         'scheduled',
