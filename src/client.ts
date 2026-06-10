@@ -21,6 +21,7 @@
  * API calls are needed. Data is extracted during normalizePipelineData().
  */
 import fetch from 'cross-fetch';
+import type { APIResponse } from 'playwright';
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
 
 export interface RawPipelineRow {
@@ -59,17 +60,184 @@ function withTimeout(ms: number): AbortSignal {
   return controller.signal;
 }
 
+/**
+ * Lowest-common-denominator response surface used by client.ts. Lets
+ * doFetch() return one shape regardless of transport (cross-fetch
+ * Response vs Playwright APIResponse).
+ */
+export interface UnifiedResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: { get(name: string): string | null };
+  json(): Promise<any>;
+  text(): Promise<string>;
+}
+
+function adaptPlaywrightResponse(res: APIResponse): UnifiedResponse {
+  // Playwright returns headers as a Record<string,string>, lowercased.
+  const headersMap = res.headers();
+  return {
+    ok: res.ok(),
+    status: res.status(),
+    statusText: res.statusText() || '',
+    headers: {
+      get(name: string): string | null {
+        return headersMap[name.toLowerCase()] ?? null;
+      },
+    },
+    json: () => res.json(),
+    text: () => res.text(),
+  };
+}
+
+function adaptNodeResponse(res: Response): UnifiedResponse {
+  return {
+    ok: res.ok,
+    status: res.status,
+    statusText: res.statusText || '',
+    headers: { get: (name: string) => res.headers.get(name) },
+    json: () => res.json(),
+    text: () => res.text(),
+  };
+}
+
+/**
+ * Pull individual Set-Cookie header values out of a fetch Response.
+ * cross-fetch resolves to node-fetch v2 here, whose Headers exposes the
+ * non-standard raw() returning string arrays; undici (and future runtimes)
+ * expose getSetCookie(). headers.get() is the last resort — it joins
+ * multiple Set-Cookie values with ", ", so split only on commas that start
+ * a new `name=` pair (an `Expires=Thu, 01 Jan...` comma doesn't match).
+ */
+function extractSetCookies(res: Response): string[] {
+  const h = res.headers as any;
+  if (typeof h.getSetCookie === 'function') return h.getSetCookie();
+  if (typeof h.raw === 'function') return h.raw()['set-cookie'] ?? [];
+  const joined = res.headers.get('set-cookie');
+  if (!joined) return [];
+  return joined.split(/,(?=\s*[a-zA-Z0-9!#$%&'*+\-.^_`|~]+=)/).map((c) => c.trim());
+}
+
+/**
+ * Mirror Set-Cookie values into the in-memory session cookie map. Ashby
+ * rotates ashby_session_token every few minutes; without this, the next
+ * request goes out with the pre-rotation token and 401s mid-extraction.
+ * Honors deletions (empty value / Max-Age=0 / past Expires). Returns true
+ * if any cookie actually changed, so the caller can persist the new map.
+ */
+function mirrorSetCookies(session: AshbySession, setCookies: string[]): boolean {
+  let changed = false;
+  for (const raw of setCookies) {
+    const segments = raw.split(';');
+    const nameValue = segments[0] ?? '';
+    const eqIndex = nameValue.indexOf('=');
+    if (eqIndex <= 0) continue;
+    const name = nameValue.slice(0, eqIndex).trim();
+    const value = nameValue.slice(eqIndex + 1).trim();
+    if (!name) continue;
+
+    let expired = value === '';
+    for (const seg of segments.slice(1)) {
+      const [attr, attrValue] = seg.split('=').map((s) => s?.trim());
+      const attrLower = (attr || '').toLowerCase();
+      if (attrLower === 'max-age' && Number(attrValue) <= 0) expired = true;
+      if (attrLower === 'expires' && attrValue) {
+        const ts = Date.parse(seg.slice(seg.indexOf('=') + 1).trim());
+        if (!Number.isNaN(ts) && ts < Date.now()) expired = true;
+      }
+    }
+
+    if (expired) {
+      if (name in session.cookies) {
+        delete session.cookies[name];
+        changed = true;
+      }
+    } else if (session.cookies[name] !== value) {
+      session.cookies[name] = value;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Single transport-aware HTTP entry point for the Ashby client.
+ *
+ * Two modes, picked by `session.requestContext`:
+ *
+ *   - **Live mode** (`requestContext` set, by server.ts liveContext): route
+ *     through Playwright's APIRequestContext, which inherits cookies from
+ *     the live BrowserContext the user did SSO in. Ashby keeps the session
+ *     fresh because every call comes "from" the browser it knows.
+ *
+ *   - **Legacy mode** (no `requestContext`): cookie header from the
+ *     in-memory `session.cookies` map + cross-fetch. Same behavior the
+ *     CLI / cookie-paste path has always had.
+ *
+ * Caller passes only resource-specific headers (content-type, etc.).
+ * doFetch handles auth (cookie OR live context) + csrf + timeout.
+ */
+async function doFetch(
+  session: AshbySession,
+  url: string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string }
+): Promise<UnifiedResponse> {
+  const callerHeaders: Record<string, string> = { ...(init?.headers || {}) };
+  if (!callerHeaders.accept) callerHeaders.accept = 'application/json';
+  if (session.csrfToken && !callerHeaders['x-csrf-token']) {
+    callerHeaders['x-csrf-token'] = session.csrfToken;
+  }
+
+  if (session.requestContext) {
+    const res = await session.requestContext.fetch(url, {
+      method: init?.method || 'GET',
+      headers: callerHeaders,
+      data: init?.body,
+      timeout: REQUEST_TIMEOUT_MS,
+      failOnStatusCode: false,
+    });
+    return adaptPlaywrightResponse(res);
+  }
+
+  // Legacy: cookies from session.cookies map.
+  const cookieHeader = Object.entries(session.cookies)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+  const headers: Record<string, string> = { cookie: cookieHeader, ...callerHeaders };
+  const res = await fetch(url, {
+    method: init?.method || 'GET',
+    headers,
+    body: init?.body,
+    signal: withTimeout(REQUEST_TIMEOUT_MS),
+  });
+
+  // Ashby rotates session cookies on arbitrary responses, not just org
+  // switches — mirror every rotation so the next request stays authenticated,
+  // and let the owner persist the new map (server.ts writes it to
+  // .ashby-session.json so the rotation chain survives across runs).
+  // Only successful responses advance the chain: a 401's Set-Cookie clears
+  // the token, and mirroring that would wipe a jar that a concurrent
+  // response may have just validly rotated.
+  // Note: node-fetch follows redirects and drops intermediate Set-Cookie
+  // headers; fine here, the GraphQL/JSON endpoints never redirect.
+  if (res.ok && mirrorSetCookies(session, extractSetCookies(res))) {
+    session.onCookiesRotated?.(session);
+  }
+
+  return adaptNodeResponse(res);
+}
+
 export async function fetchWithSession(
   session: AshbySession,
   url: string,
   init?: RequestInit
 ): Promise<unknown> {
-  const headers = {
-    ...createAuthHeaders(session),
-    ...(init?.headers as Record<string, string> | undefined)
-  };
-
-  const res = await fetch(url, { ...init, headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
+  const res = await doFetch(session, url, {
+    method: (init?.method as string | undefined),
+    headers: init?.headers as Record<string, string> | undefined,
+    body: typeof init?.body === 'string' ? init.body : undefined,
+  });
   if (!res.ok) {
     throw new Error(`Request failed ${res.status} ${res.statusText} for ${url}`);
   }
@@ -206,19 +374,19 @@ interface ApplicationsResponse {
 
 async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<string> {
   const url = 'https://app.ashbyhq.com/api/csrf/token';
-  const headers = createAuthHeaders(session);
-  
-  // Debug: Check if we have the critical auth cookie
-  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+
+  // Auth check only applies to the cookie-header path. The live
+  // BrowserContext path carries cookies in the browser jar — they may not
+  // be mirrored into session.cookies and we shouldn't refuse a live call
+  // just because session.cookies happens to be empty.
+  if (!session.requestContext &&
+      !session.cookies['ashby_session_token'] &&
+      !session.cookies['authenticated']) {
     throw new Error('Missing authentication cookies. Please run "auth" or "auth-cookie" to refresh your session.');
   }
-  
+
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers,
-      signal: withTimeout(REQUEST_TIMEOUT_MS),
-    });
+    const res = await doFetch(session, url, { method: 'GET' });
 
     if (res.ok) {
       const response = await res.json() as { token: string };
@@ -228,11 +396,16 @@ async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<strin
     // If 401, the session might be invalid - don't retry
     if (res.status === 401) {
       const errorText = await res.text();
-      // Check if cookies are present
+      // Adapt the message to whichever transport we're using.
       const hasAuthCookie = session.cookies['ashby_session_token'] || session.cookies['authenticated'];
-      const errorMsg = hasAuthCookie 
-        ? `Session appears expired. Please refresh your cookies by running 'auth-cookie' again with fresh cookies from your browser.`
-        : `Missing authentication cookies. Please run 'auth' or 'auth-cookie' to set up your session.`;
+      let errorMsg: string;
+      if (session.requestContext) {
+        errorMsg = 'Live browser session no longer authenticated. Re-run Log into Ashby.';
+      } else if (hasAuthCookie) {
+        errorMsg = "Session appears expired. Please refresh your cookies by running 'auth-cookie' again with fresh cookies from your browser.";
+      } else {
+        errorMsg = "Missing authentication cookies. Please run 'auth' or 'auth-cookie' to set up your session.";
+      }
       throw new Error(`Failed to fetch CSRF token: ${res.status} ${res.statusText}. ${errorMsg}`);
     }
 
@@ -272,23 +445,16 @@ async function graphqlQuery<T>(
   const url = `https://app.ashbyhq.com/api/graphql?op=${operationName}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const headers = createAuthHeaders(session);
-    headers['content-type'] = 'application/json';
-    if (session.csrfToken) {
-      headers['x-csrf-token'] = session.csrfToken;
-    }
-
     const body = JSON.stringify({
       operationName,
       query,
       variables
     });
 
-    const res = await fetch(url, {
+    const res = await doFetch(session, url, {
       method: 'POST',
-      headers,
+      headers: { 'content-type': 'application/json' },
       body,
-      signal: withTimeout(REQUEST_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -388,35 +554,26 @@ export async function fetchAvailableOrgs(session: AshbySession): Promise<OrgInfo
 async function switchOrgContext(session: AshbySession, userId: string): Promise<void> {
   const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
 
-  // Use existing CSRF for the switch POST — no need to fetch a fresh one
-  const headers = createAuthHeaders(session);
-  if (session.csrfToken) {
-    headers['x-csrf-token'] = session.csrfToken;
-  }
-  headers['content-type'] = 'application/json';
-
-  const res = await fetch(url, { method: 'POST', headers, signal: withTimeout(REQUEST_TIMEOUT_MS) });
+  const res = await doFetch(session, url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  });
 
   if (!res.ok) {
     const errorText = await res.text();
     throw new Error(`Failed to switch org context: ${res.status} ${res.statusText}. Response: ${errorText.substring(0, 200)}`);
   }
 
-  // Update cookies from response headers (if any)
-  const setCookieHeaders = res.headers.get('set-cookie');
-  if (setCookieHeaders) {
-    const cookies = setCookieHeaders.split(',').map(c => c.trim());
-    for (const cookie of cookies) {
-      const [nameValue] = cookie.split(';');
-      const [name, value] = nameValue.split('=');
-      if (name && value) {
-        session.cookies[name.trim()] = value.trim();
-      }
-    }
-  }
+  // Set-Cookie mirroring happens centrally in doFetch — the org switch's
+  // session updates are already in session.cookies by the time we get here.
 
-  // Don't refresh CSRF here — the token is session-scoped, not org-scoped.
-  // graphqlQuery retries with a fresh CSRF on 403, so stale tokens self-heal.
+  // The CSRF token is IDENTITY-scoped and change_user switches identity, so
+  // the old token is invalid from this point on. Refresh it eagerly: Ashby
+  // answers a stale-CSRF GraphQL call with 401 (not the 403 graphqlQuery's
+  // self-heal listens for) and revokes the whole session chain — observed
+  // live when the enrichment pass queried right after a switch without
+  // refreshing, killing every subsequent request in the run.
+  session.csrfToken = await fetchCsrfToken(session);
 }
 
 interface AvailableIdentityResponse {
@@ -450,14 +607,7 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   
   // Fetch all available identities (orgs) the user can access
   const url = 'https://app.ashbyhq.com/api/auth/available_identities';
-  const headers = createAuthHeaders(session);
-  headers['x-csrf-token'] = csrfToken;
-
-  const res = await fetch(url, {
-    method: 'GET',
-    headers,
-    signal: withTimeout(REQUEST_TIMEOUT_MS),
-  });
+  const res = await doFetch(session, url, { method: 'GET' });
 
   if (!res.ok) {
     console.warn(`Could not fetch available identities: ${res.status} ${res.statusText}`);

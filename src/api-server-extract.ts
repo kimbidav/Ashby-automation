@@ -160,6 +160,18 @@ interface OrgCacheEntry {
 const orgCache = new Map<string, OrgCacheEntry>();
 const ORG_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes per org
 
+// Total wall-clock budget for one extraction run. Callers waiting on the
+// extract (the dashboard backend's ASHBY_REFRESH_TIMEOUT_SEC, default 300s)
+// must allow at least this much plus ~60s of flatten/restore/network slack.
+const EXTRACT_BUDGET_MS = parseInt(process.env.ASHBY_EXTRACT_BUDGET_SEC || '240', 10) * 1000;
+
+// Guaranteed floor for the targeted enrichment pass. The org sweep itself is
+// unbounded (it takes as long as Ashby takes), so on a slow day it can eat
+// the whole EXTRACT_BUDGET_MS and enrichment would never run no matter how
+// often the user re-fetches. The floor ensures enrichment always gets at
+// least this much time. Set to 0 to restore the old leftovers-only behavior.
+const ENRICH_MIN_BUDGET_MS = parseInt(process.env.ASHBY_ENRICH_MIN_BUDGET_SEC || '180', 10) * 1000;
+
 export function getOrgCacheStats() {
   let cachedOrgs = 0;
   let cachedCandidates = 0;
@@ -280,9 +292,14 @@ export async function extractPipeline(
   if (!authDead && allCandidates.length > 0) {
     const elapsedSoFar = Date.now() - startTime;
     // Leave at least 90s for the rest of the pipeline (restore + flatten +
-    // network return). Anything above 60s of remaining budget gets spent on
-    // enrichment; below that we skip rather than risk timing out.
-    const budgetForEnrich = Math.max(0, 240_000 - elapsedSoFar - 90_000);
+    // network return) out of the overall budget — but never give enrichment
+    // less than its guaranteed floor, even when a slow sweep already blew
+    // the budget. Below 60s (only possible when the floor is configured
+    // down) we skip rather than risk timing out.
+    const budgetForEnrich = Math.max(
+      EXTRACT_BUDGET_MS - elapsedSoFar - 90_000,
+      ENRICH_MIN_BUDGET_MS,
+    );
     if (budgetForEnrich >= 60_000) {
       const SUSPECT_STATUS = new Set([
         'scheduled',
@@ -304,11 +321,17 @@ export async function extractPipeline(
       };
       try {
         onProgress?.(orgsWithUserId.length, orgsWithUserId.length, 'Enriching scheduled candidates...');
+        // Concurrency is only safe in live mode, where the browser context's
+        // cookie jar absorbs token rotation server-side. In legacy cookie
+        // mode, N in-flight requests share one rotating token: the first
+        // response invalidates it, the rest 401, and Ashby revokes the whole
+        // session chain. Sequential keeps exactly one token in flight.
+        const enrichConcurrency = session.requestContext ? 5 : 1;
         allCandidates = await enrichCandidatesWithDetails(
           session,
           allCandidates,
           orgsWithUserId,
-          { maxConcurrent: 5, shouldEnrich, deadlineMs: budgetForEnrich },
+          { maxConcurrent: enrichConcurrency, shouldEnrich, deadlineMs: budgetForEnrich },
         );
       } catch (err: any) {
         console.warn(`⚠️  Enrichment pass failed (non-fatal): ${err?.message?.substring(0, 150)}`);

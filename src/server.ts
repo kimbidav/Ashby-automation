@@ -11,12 +11,24 @@
  * Result cache: successful extractions are cached for 10 minutes.
  * Subsequent requests (even with a different/expired cookie) return the
  * cached result instantly, because the underlying Ashby data doesn't
- * change that fast and cookies rotate every few minutes.
+ * change that fast.
+ *
+ * Session rotation: Ashby rotates cookies every few minutes. In legacy
+ * (non-live-browser) mode, doFetch mirrors every Set-Cookie back into the
+ * session and validateCookie attaches a hook that persists the rotated map
+ * to .ashby-session.json — so one extraction completes without a mid-sweep
+ * 401 and later runs reuse the rotated chain until Ashby's ~7-day login
+ * expiry.
  */
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
+import { loadSession, persistSessionCookies } from './session.js';
+import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
 
 const app = express();
@@ -99,30 +111,327 @@ if (STORED_COOKIE) {
   console.log('ASHBY_SESSION_COOKIE is set — extraction will use the stored session (no cookie paste needed)');
 }
 
+// ── Live SSO browser (Phase 2 architecture) ───────────────────────────────
+//
+// When `liveContext` is set, /api/extract routes every Ashby HTTP call
+// through Playwright's APIRequestContext, which sources cookies from the
+// live browser jar the user did SSO in. That dodges Ashby's
+// "the browser that authenticated quit, who are you?" invalidation —
+// the SSO browser stays open as long as the user wants, and refresh
+// calls work for as long as the browser stays alive.
+//
+// Lifecycle:
+//   POST /api/auth/start → launches headed Chromium, loads ashbyhq signin,
+//                          stores the BrowserContext here.
+//   GET  /api/auth/status → probes the context's cookies / identity endpoint.
+//   POST /api/auth/stop  → closes the context, clears this handle.
+//   On context.on('close') (user Cmd-Q'd Chromium), clear the handle too.
+
+let liveContext: BrowserContext | null = null;
+let liveContextStartedAt: string | null = null;
+
+const PROFILE_DIR = path.resolve(
+  process.env.PLAYWRIGHT_PROFILE_DIR || '.playwright-browser-data',
+);
+
+async function probeLiveAuth(ctx: BrowserContext): Promise<{ ok: boolean; reason?: string; csrfToken?: string }> {
+  // Cheap endpoint that requires an authenticated session — the CSRF token
+  // endpoint returns 200 + a token when the cookie jar is valid, 401 when not.
+  try {
+    const res = await ctx.request.fetch('https://app.ashbyhq.com/api/csrf/token', {
+      method: 'GET',
+      timeout: 8000,
+      failOnStatusCode: false,
+    });
+    if (res.ok()) {
+      const body = await res.json().catch(() => ({}));
+      return { ok: true, csrfToken: body?.token };
+    }
+    return { ok: false, reason: `auth probe returned ${res.status()}` };
+  } catch (err: any) {
+    return { ok: false, reason: err?.message || 'probe error' };
+  }
+}
+
+function liveSessionFromContext(ctx: BrowserContext, csrfToken?: string): AshbySession {
+  // Build an AshbySession whose `requestContext` triggers client.ts's live
+  // mode. cookies map is empty — doFetch routes around it in live mode, and
+  // the CSRF token hint lets the first call skip a roundtrip.
+  return {
+    cookies: {},
+    csrfToken,
+    orgIds: [],
+    requestContext: ctx.request,
+  };
+}
+
 // ── Cookie validation helper ──────────────────────────────────────────────
 
-function validateCookie(cookie: unknown): { session: ReturnType<typeof createSessionFromCookie> } | { error: string; status: number } {
-  // Priority: request body cookie > env var stored cookie
-  const raw = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : STORED_COOKIE;
+/**
+ * Resolve an Ashby session by trying, in order:
+ *   1. Cookie in the request body (legacy paste flow)
+ *   2. STORED_COOKIE env var (legacy Railway deploy)
+ *   3. The persistent Playwright profile via loadSession() — this is the
+ *      no-paste happy path for local runs: log in once with
+ *      `npm run start -- auth`, the session lives in .playwright-browser-data/
+ *      and `.ashby-session.json` for ~7 days, and every extract call here
+ *      transparently picks it up without any cookie wrangling on the caller.
+ */
+async function validateCookie(cookie: unknown): Promise<{ session: AshbySession } | { error: string; status: number }> {
+  const bodyCookie = (typeof cookie === 'string' && cookie.trim()) ? cookie.trim() : '';
 
-  if (!raw) {
-    return {
-      error: 'No cookie provided and ASHBY_SESSION_COOKIE env var is not set. Either paste a cookie or set the env var on Railway.',
-      status: 400,
-    };
+  // Every legacy-transport session gets this hook: doFetch fires it whenever
+  // Ashby rotates a cookie via Set-Cookie, and persistSessionCookies writes
+  // the rotated map to .ashby-session.json. That keeps the on-disk session
+  // current across runs (Ashby rotates every few minutes — the login-day
+  // token alone goes stale almost immediately), so one extraction completes
+  // without a mid-sweep 401 and the next run reuses the rotated chain.
+  const attachPersistence = (session: AshbySession, seedHash?: string): AshbySession => {
+    if (seedHash) session.seedHash = seedHash;
+    session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+    return session;
+  };
+
+  // 1. Explicit body cookie — back-compat for legacy clients that still
+  // paste a token. Wins over all other sources; the caller knew what
+  // they wanted. Persisting its rotations turns a one-time paste into a
+  // durable session the no-cookie path picks up on the next call.
+  if (bodyCookie) {
+    const session = createSessionFromCookie(bodyCookie);
+    if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+      return {
+        error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
+        status: 400,
+      };
+    }
+    return { session: attachPersistence(session) };
   }
 
-  const session = createSessionFromCookie(raw);
-
-  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
-    return {
-      error: 'Cookie string is missing the ashby_session_token. Make sure you copy the full cookie from DevTools.',
-      status: 400,
-    };
+  // 2. Live SSO browser. The user kept Chromium open from /api/auth/start;
+  // we route through its APIRequestContext so cookies stay fresh. No
+  // persistence hook — the live cookie map is empty by design and the
+  // Playwright profile owns those cookies.
+  if (liveContext) {
+    const probe = await probeLiveAuth(liveContext);
+    if (probe.ok) {
+      return { session: liveSessionFromContext(liveContext, probe.csrfToken) };
+    }
+    console.warn(`[live-auth] liveContext present but probe failed: ${probe.reason}`);
+    // Don't bail with 401 yet — STORED_COOKIE / persistent-file paths
+    // may still authenticate via the legacy transport.
   }
 
-  return { session };
+  // 3. STORED_COOKIE env var (legacy Railway deploy). The env value is
+  // frozen at deploy time while Ashby rotates the real token underneath it,
+  // so prefer the persisted session file when it descends from this same
+  // seed cookie (matching seedHash). A different seedHash means the operator
+  // deployed a fresh cookie — that wins, and its first rotation overwrites
+  // the file with the new chain.
+  if (STORED_COOKIE) {
+    const seedHash = crypto.createHash('sha256').update(STORED_COOKIE).digest('hex');
+    try {
+      const persisted = await loadSession();
+      if (
+        persisted?.seedHash === seedHash &&
+        (persisted.cookies?.['ashby_session_token'] || persisted.cookies?.['authenticated'])
+      ) {
+        return { session: attachPersistence(persisted, seedHash) };
+      }
+    } catch {
+      // No persisted descendant — fall back to the raw env cookie.
+    }
+    const stored = createSessionFromCookie(STORED_COOKIE);
+    if (stored.cookies['ashby_session_token'] || stored.cookies['authenticated']) {
+      return { session: attachPersistence(stored, seedHash) };
+    }
+  }
+
+  // 4. .ashby-session.json / .playwright-browser-data (the cookie-paste
+  // and persistent-profile fallbacks). loadSession knows the right order.
+  try {
+    const session = await loadSession();
+    if (session?.cookies?.['ashby_session_token'] || session?.cookies?.['authenticated']) {
+      return { session: attachPersistence(session, session.seedHash) };
+    }
+  } catch {
+    // Persistent session unavailable — fall through to the 401 below.
+  }
+
+  return {
+    // 401 (not 400): from the caller's perspective this is "no auth," which
+    // is what the dashboard's session_dead branch keys off of to surface
+    // the "Log into Ashby" recovery instructions.
+    error: "No Ashby session available. Open Log into Ashby in the dashboard, or pass a cookie in the request body.",
+    status: 401,
+  };
 }
+
+// ── Live-auth endpoints ─────────────────────────────────────────────────
+
+async function clearStaleSingletonLocks(profileDir: string): Promise<void> {
+  // Chromium leaves SingletonLock / SingletonCookie / SingletonSocket files
+  // when it shuts down ungracefully (crash, kill -9, Cmd-Q during navigation).
+  // Subsequent launches see these and abort with "Failed to create a
+  // ProcessSingleton." Since this server is the sole owner of the profile,
+  // any of those files we find when liveContext is null is by definition
+  // stale, so we delete them. If a real Chromium process is still holding
+  // the profile, launchPersistentContext will fail anyway and we surface
+  // the error to the user.
+  for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      await fs.unlink(path.join(profileDir, name));
+      console.log(`[live-auth] cleared stale ${name}`);
+    } catch {
+      // Doesn't exist — that's the happy path; nothing to do.
+    }
+  }
+}
+
+app.post('/api/auth/start', async (_req: express.Request, res: express.Response) => {
+  if (liveContext) {
+    // Already up. Return current status instead of double-launching.
+    const probe = await probeLiveAuth(liveContext);
+    res.json({
+      already_running: true,
+      authenticated: probe.ok,
+      reason: probe.reason,
+      started_at: liveContextStartedAt,
+    });
+    return;
+  }
+
+  try {
+    // Clear stale singleton files from a previous ungraceful shutdown.
+    // Safe because the only owner of this profile is this server process,
+    // and we just confirmed liveContext === null above.
+    await clearStaleSingletonLocks(PROFILE_DIR);
+
+    // Launch the persistent context HEADED so the user can do SSO. The
+    // context stays attached to this Node process; on close we clear the
+    // module-level handle so the next call sees a clean state.
+    //
+    // Anti-automation-detection setup. Google's sign-in flow checks for
+    // several Playwright telltales and refuses auth if it sees them. We:
+    //   1) Drop Playwright's default --enable-automation flag (otherwise
+    //      Chrome shows "Chrome is being controlled by automated test
+    //      software" and exposes the `chrome.app` / automation markers).
+    //   2) Drop --use-mock-keychain so the OS keychain works for password
+    //      autofill (Google checks).
+    //   3) Add an init script that overrides navigator.webdriver and a few
+    //      other common detection points BEFORE any page script runs.
+    const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+      headless: false,
+      viewport: { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      ignoreDefaultArgs: [
+        '--enable-automation',
+        '--use-mock-keychain',
+      ],
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--disable-features=IsolateOrigins,site-per-process,AutomationControlled',
+        '--password-store=basic',
+      ],
+    });
+
+    // Run BEFORE every page's scripts. Suppresses the most common
+    // navigator.webdriver detection used by Google sign-in.
+    await ctx.addInitScript(() => {
+      // navigator.webdriver === true is the canonical automation signal.
+      try {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+      } catch {/* already overridden */}
+      // navigator.languages is empty in headless; Google flags that.
+      try {
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en'],
+          configurable: true,
+        });
+      } catch {/* ignore */}
+      // navigator.plugins is empty in automation; real Chrome has at
+      // least the PDF viewer. Spoof a non-zero length.
+      try {
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5],
+          configurable: true,
+        });
+      } catch {/* ignore */}
+      // chrome.runtime is missing under automation; Google checks for it.
+      try {
+        if (!(window as any).chrome) (window as any).chrome = {};
+        if (!(window as any).chrome.runtime) (window as any).chrome.runtime = {};
+      } catch {/* ignore */}
+    });
+
+    ctx.on('close', () => {
+      console.log('[live-auth] BrowserContext closed; clearing liveContext.');
+      liveContext = null;
+      liveContextStartedAt = null;
+    });
+
+    const page = ctx.pages()[0] || await ctx.newPage();
+    await page.goto('https://app.ashbyhq.com/signin', { waitUntil: 'domcontentloaded' }).catch((err) => {
+      console.warn('[live-auth] initial navigation warning:', err?.message);
+    });
+
+    liveContext = ctx;
+    liveContextStartedAt = new Date().toISOString();
+    console.log(`[live-auth] Chromium opened with profile ${PROFILE_DIR}. Awaiting SSO.`);
+
+    res.status(202).json({
+      started: true,
+      already_running: false,
+      profile_dir: PROFILE_DIR,
+      started_at: liveContextStartedAt,
+      message: 'Chromium is open at app.ashbyhq.com. Sign in, then leave the window open — refresh will work as long as Chromium is alive.',
+    });
+  } catch (err: any) {
+    console.error('[live-auth] failed to start:', err?.message);
+    res.status(500).json({ error: 'live_auth_start_failed', detail: err?.message });
+  }
+});
+
+app.get('/api/auth/status', async (_req: express.Request, res: express.Response) => {
+  if (!liveContext) {
+    res.json({
+      live_active: false,
+      authenticated: false,
+      reason: 'No live browser context. Call POST /api/auth/start to open one.',
+    });
+    return;
+  }
+  const probe = await probeLiveAuth(liveContext);
+  res.json({
+    live_active: true,
+    authenticated: probe.ok,
+    reason: probe.reason,
+    started_at: liveContextStartedAt,
+  });
+});
+
+app.post('/api/auth/stop', async (_req: express.Request, res: express.Response) => {
+  if (!liveContext) {
+    res.json({ live_active: false, closed: false });
+    return;
+  }
+  try {
+    const ctx = liveContext;
+    liveContext = null;
+    liveContextStartedAt = null;
+    await ctx.close().catch(() => {});
+    res.json({ live_active: false, closed: true });
+  } catch (err: any) {
+    res.status(500).json({ error: 'live_auth_stop_failed', detail: err?.message });
+  }
+});
 
 function formatResult(data: ExtractResult & { extraction_stats?: Record<string, unknown> }): CachedResult['data'] & { extraction_stats?: Record<string, unknown> } {
   return {
@@ -166,7 +475,7 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
     return;
   }
 
-  const validation = validateCookie(req.body.cookie);
+  const validation = await validateCookie(req.body.cookie);
   if ('error' in validation) {
     res.status(validation.status).json({ error: validation.error });
     return;
@@ -184,7 +493,7 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
 
 // ── Async extraction (start + poll) ──────────────────────────────────────
 
-app.post('/api/extract/start', (req: express.Request, res: express.Response) => {
+app.post('/api/extract/start', async (req: express.Request, res: express.Response) => {
   const force = req.body.force === true;
   // Return cache if fresh — no need to even validate the cookie
   const cached = !force ? getCachedResult() : null;
@@ -203,7 +512,7 @@ app.post('/api/extract/start', (req: express.Request, res: express.Response) => 
     return;
   }
 
-  const validation = validateCookie(req.body.cookie);
+  const validation = await validateCookie(req.body.cookie);
   if ('error' in validation) {
     res.status(validation.status).json({ error: validation.error });
     return;

@@ -2,12 +2,17 @@
  * types.ts — Shared TypeScript interfaces used across the project.
  *
  * Key types:
- *   AshbySession      — Auth cookies + optional CSRF token, saved to .ashby-session.json
+ *   AshbySession      — Auth cookies + optional CSRF token, saved to .ashby-session.json.
+ *                       When `requestContext` is set, the session is being driven by
+ *                       a live Playwright BrowserContext (server.ts's `liveContext`)
+ *                       and HTTP calls go through that context — cookies come from
+ *                       the live browser, not from the in-memory `cookies` map.
  *   Candidate         — One active application: pipeline stage, interview data, feedback
  *   InterviewEvent    — A scheduled interview with interviewers and scorecard submissions
  *   InterviewFeedback — One interviewer's feedback and rating for an interview
  *   Company / Job     — Lightweight containers used for CSV/JSON lookup
  */
+import type { APIRequestContext } from 'playwright';
 
 export interface Company {
   id: string;
@@ -106,4 +111,26 @@ export interface AshbySession {
   cookies: Record<string, string>;
   csrfToken?: string;
   orgIds: string[];
+  /**
+   * Playwright APIRequestContext sourced from a live BrowserContext. When
+   * present, client.ts routes every HTTP call through it — cookies are read
+   * from the live browser jar (always fresh), which dodges Ashby's
+   * "the browser that authenticated quit, who are you?" invalidation.
+   * Not serialized to disk; only set on the in-memory session held by
+   * server.ts when login mode is "live."
+   */
+  requestContext?: APIRequestContext;
+  /**
+   * Invoked by doFetch whenever a Set-Cookie response rotated a cookie value
+   * in `cookies`. server.ts attaches a hook that persists the rotated map to
+   * .ashby-session.json so the session survives across runs. Never serialized.
+   */
+  onCookiesRotated?: (session: AshbySession) => void;
+  /**
+   * sha256 of the cookie string this session's rotation chain descends from
+   * (e.g. the STORED_COOKIE env var). Lets validateCookie tell whether a
+   * persisted session file is a rotation descendant of the configured seed
+   * cookie or predates it. Persisted alongside the cookie map.
+   */
+  seedHash?: string;
 }
