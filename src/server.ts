@@ -93,9 +93,14 @@ function cleanupOldJobs() {
 
 // ── Health check ──────────────────────────────────────────────────────────
 
+// Bump on behavior changes so a curl to /api/health confirms which build a
+// deployment (e.g. Railway) is actually running.
+const BUILD_STAMP = '2026-06-11-paste-seed-fallback';
+
 app.get('/api/health', (_req: express.Request, res: express.Response) => {
   res.json({
     status: 'ok',
+    build: BUILD_STAMP,
     timestamp: new Date().toISOString(),
     stored_cookie_configured: !!STORED_COOKIE,
     result_cache_age_seconds: resultCache
@@ -194,10 +199,26 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
   };
 
   // 1. Explicit body cookie — back-compat for legacy clients that still
-  // paste a token. Wins over all other sources; the caller knew what
-  // they wanted. Persisting its rotations turns a one-time paste into a
-  // durable session the no-cookie path picks up on the next call.
+  // paste a token (the Lovable dashboard re-sends its stored paste on EVERY
+  // sync). Ashby rotates the token within minutes of the paste, so the raw
+  // value is usually dead by the second sync — but the persisted session
+  // file holds the live chain that descends from it. Same seedHash logic as
+  // the STORED_COOKIE branch below: a persisted chain descended from this
+  // exact seed wins (it's fresher); a different seed means the caller
+  // deliberately pasted a NEW token, and that wins instead.
   if (bodyCookie) {
+    const seedHash = crypto.createHash('sha256').update(bodyCookie).digest('hex');
+    try {
+      const persisted = await loadSession();
+      if (
+        persisted?.seedHash === seedHash &&
+        (persisted.cookies?.['ashby_session_token'] || persisted.cookies?.['authenticated'])
+      ) {
+        return { session: attachPersistence(persisted, seedHash) };
+      }
+    } catch {
+      // No persisted descendant — fall through to the raw pasted cookie.
+    }
     const session = createSessionFromCookie(bodyCookie);
     if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
       return {
@@ -205,7 +226,9 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
         status: 400,
       };
     }
-    return { session: attachPersistence(session) };
+    // Tag the chain with this seed so the next sync's identical paste
+    // matches it instead of resending the rotated-away raw token.
+    return { session: attachPersistence(session, seedHash) };
   }
 
   // 2. Live SSO browser. The user kept Chromium open from /api/auth/start;
