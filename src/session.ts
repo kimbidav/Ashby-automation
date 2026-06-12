@@ -24,7 +24,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { AshbySession } from './types.js';
 
-const SESSION_FILE = path.join(process.cwd(), '.ashby-session.json');
+// Override with ASHBY_SESSION_FILE to put the session on a durable mount —
+// on Railway the repo filesystem is wiped every deploy, so the shared team
+// session lives on a volume (e.g. /data/ashby-session.json) instead.
+const SESSION_FILE = process.env.ASHBY_SESSION_FILE || path.join(process.cwd(), '.ashby-session.json');
 
 // Serializes session-file writes so concurrent rotations can't interleave.
 let persistChain: Promise<void> = Promise.resolve();

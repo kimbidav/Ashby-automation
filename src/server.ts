@@ -27,7 +27,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
-import { fetchArchiveStatuses } from './client.js';
+import { fetchArchiveStatuses, fetchCsrfToken } from './client.js';
 import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
@@ -37,6 +37,35 @@ const PORT = parseInt(process.env.PORT || '3001', 10);
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+
+// ── Shared-secret auth ─────────────────────────────────────────────────────
+//
+// When EXTRACTOR_SHARED_SECRET is set (the Railway team deployment, which
+// holds an org-wide Ashby session), extraction/session endpoints require a
+// matching X-Extractor-Secret header — only the Supabase edge functions hold
+// the secret, so the org pipeline can't be pulled by anyone with the URL.
+// Unset locally → middleware is a no-op and the local flow is unchanged.
+
+const SHARED_SECRET = process.env.EXTRACTOR_SHARED_SECRET || '';
+
+function requireSecret(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!SHARED_SECRET) {
+    next();
+    return;
+  }
+  const provided = req.get('x-extractor-secret') || '';
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(SHARED_SECRET).digest();
+  if (provided && crypto.timingSafeEqual(a, b)) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'missing_or_invalid_extractor_secret' });
+}
+
+app.use('/api/extract', requireSecret);
+app.use('/api/applications', requireSecret);
+app.use('/api/session', requireSecret);
 
 // ── Result cache (10-min TTL) ─────────────────────────────────────────────
 
@@ -95,7 +124,7 @@ function cleanupOldJobs() {
 
 // Bump on behavior changes so a curl to /api/health confirms which build a
 // deployment (e.g. Railway) is actually running.
-const BUILD_STAMP = '2026-06-11-paste-seed-fallback';
+const BUILD_STAMP = '2026-06-12-shared-session-seed';
 
 app.get('/api/health', (_req: express.Request, res: express.Response) => {
   res.json({
@@ -103,6 +132,7 @@ app.get('/api/health', (_req: express.Request, res: express.Response) => {
     build: BUILD_STAMP,
     timestamp: new Date().toISOString(),
     stored_cookie_configured: !!STORED_COOKIE,
+    shared_secret_required: !!SHARED_SECRET,
     result_cache_age_seconds: resultCache
       ? Math.round((Date.now() - resultCache.timestamp) / 1000)
       : null,
@@ -245,40 +275,30 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
     // may still authenticate via the legacy transport.
   }
 
-  // 3. STORED_COOKIE env var (legacy Railway deploy). The env value is
-  // frozen at deploy time while Ashby rotates the real token underneath it,
-  // so prefer the persisted session file when it descends from this same
-  // seed cookie (matching seedHash). A different seedHash means the operator
-  // deployed a fresh cookie — that wins, and its first rotation overwrites
-  // the file with the new chain.
-  if (STORED_COOKIE) {
-    const seedHash = crypto.createHash('sha256').update(STORED_COOKIE).digest('hex');
-    try {
-      const persisted = await loadSession();
-      if (
-        persisted?.seedHash === seedHash &&
-        (persisted.cookies?.['ashby_session_token'] || persisted.cookies?.['authenticated'])
-      ) {
-        return { session: attachPersistence(persisted, seedHash) };
-      }
-    } catch {
-      // No persisted descendant — fall back to the raw env cookie.
-    }
-    const stored = createSessionFromCookie(STORED_COOKIE);
-    if (stored.cookies['ashby_session_token'] || stored.cookies['authenticated']) {
-      return { session: attachPersistence(stored, seedHash) };
-    }
-  }
-
-  // 4. .ashby-session.json / .playwright-browser-data (the cookie-paste
-  // and persistent-profile fallbacks). loadSession knows the right order.
+  // 3. Persisted session file / Playwright profile. This is the shared-team
+  // happy path: on Railway the file lives on a durable volume, seeded via
+  // POST /api/session/seed and kept fresh by rotation persistence; locally
+  // it's .ashby-session.json / .playwright-browser-data from `auth`. It
+  // outranks STORED_COOKIE because the env value is frozen at deploy time
+  // while the file holds the live rotation chain.
   try {
     const session = await loadSession();
     if (session?.cookies?.['ashby_session_token'] || session?.cookies?.['authenticated']) {
       return { session: attachPersistence(session, session.seedHash) };
     }
   } catch {
-    // Persistent session unavailable — fall through to the 401 below.
+    // Persistent session unavailable — fall through to the env cookie.
+  }
+
+  // 4. STORED_COOKIE env var — panic fallback only, reached when no
+  // persisted session exists at all (e.g. fresh volume). Recovery from a
+  // dead persisted chain is POST /api/session/seed, not a redeploy.
+  if (STORED_COOKIE) {
+    const seedHash = crypto.createHash('sha256').update(STORED_COOKIE).digest('hex');
+    const stored = createSessionFromCookie(STORED_COOKIE);
+    if (stored.cookies['ashby_session_token'] || stored.cookies['authenticated']) {
+      return { session: attachPersistence(stored, seedHash) };
+    }
   }
 
   return {
@@ -513,6 +533,70 @@ app.post('/api/applications/archive-status', async (req: express.Request, res: e
   }
 });
 
+// ── Shared-session seed + status ──────────────────────────────────────────
+//
+// The team deployment's session lifecycle: anyone in the Ashby org pastes a
+// cookie once (~weekly) via POST /api/session/seed; the chain then rotates
+// itself on every sweep and persists to ASHBY_SESSION_FILE (a Railway
+// volume), so the seed survives deploys and restarts. GET /api/session/status
+// probes whether the persisted chain still authenticates.
+
+app.post('/api/session/seed', async (req: express.Request, res: express.Response) => {
+  const cookie = typeof req.body?.cookie === 'string' ? req.body.cookie.trim() : '';
+  if (!cookie) {
+    res.status(400).json({ error: 'Missing cookie in request body.' });
+    return;
+  }
+  const session = createSessionFromCookie(cookie);
+  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+    res.status(400).json({
+      error: 'Cookie string is missing the ashby_session_token. Copy the full Cookie header value from DevTools.',
+    });
+    return;
+  }
+  session.seedHash = crypto.createHash('sha256').update(cookie).digest('hex');
+  // Persist rotations observed during the probe too — Ashby may rotate on
+  // the very first request, and dropping that rotation kills the chain.
+  session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+  try {
+    session.csrfToken = await fetchCsrfToken(session);
+  } catch (err: any) {
+    // Don't clobber a (possibly still healthy) persisted chain with a paste
+    // that doesn't authenticate.
+    res.status(401).json({
+      error: 'Cookie did not authenticate against Ashby. Make sure you are logged in and copied the full cookie.',
+      detail: err?.message || String(err),
+    });
+    return;
+  }
+  await persistSessionCookies(session);
+  console.log('[session-seed] New shared session seeded and verified.');
+  res.json({ authenticated: true, persisted_at: new Date().toISOString() });
+});
+
+app.get('/api/session/status', async (_req: express.Request, res: express.Response) => {
+  let session: AshbySession;
+  try {
+    session = await loadSession();
+  } catch {
+    res.json({ authenticated: false, reason: 'no_session' });
+    return;
+  }
+  if (!session.cookies?.['ashby_session_token'] && !session.cookies?.['authenticated']) {
+    res.json({ authenticated: false, reason: 'no_session' });
+    return;
+  }
+  // Probe with rotation persistence attached — the probe itself may rotate
+  // the token, and that rotation must land back in the persisted file.
+  session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+  try {
+    await fetchCsrfToken(session);
+    res.json({ authenticated: true, persisted_at: (session as any).persistedAt ?? null });
+  } catch {
+    res.json({ authenticated: false, reason: 'expired', persisted_at: (session as any).persistedAt ?? null });
+  }
+});
+
 // ── Synchronous extraction ───────────────────────────────────────────────
 
 app.post('/api/extract', async (req: express.Request, res: express.Response) => {
@@ -543,6 +627,11 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
 
 // ── Async extraction (start + poll) ──────────────────────────────────────
 
+// Single-flight: the shared session can't run two sweeps at once — both
+// would fight over Ashby's server-side org context (change_user races). A
+// second start while one runs ATTACHES to the running job instead.
+let runningJobId: string | null = null;
+
 app.post('/api/extract/start', async (req: express.Request, res: express.Response) => {
   const force = req.body.force === true;
   // Return cache if fresh — no need to even validate the cookie
@@ -562,6 +651,16 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     return;
   }
 
+  if (runningJobId) {
+    const running = jobs.get(runningJobId);
+    if (running && running.status === 'running') {
+      console.log(`Attaching caller to in-flight extraction job ${running.id}`);
+      res.json({ jobId: running.id, job_id: running.id, id: running.id, status: 'running', attached: true });
+      return;
+    }
+    runningJobId = null;
+  }
+
   const validation = await validateCookie(req.body.cookie);
   if ('error' in validation) {
     res.status(validation.status).json({ error: validation.error });
@@ -578,6 +677,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     progress: { completed: 0, total: 0, current_org: 'Starting...' },
   };
   jobs.set(jobId, job);
+  runningJobId = jobId;
 
   // Fire and forget — extraction runs in the background
   extractPipeline(validation.session, (completed, total, currentOrg) => {
@@ -589,11 +689,13 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
       job.status = 'completed';
       job.completed_at = new Date().toISOString();
       job.result = result;
+      if (runningJobId === jobId) runningJobId = null;
     })
     .catch((err: any) => {
       const message = err?.message || String(err);
       job.status = 'failed';
       job.completed_at = new Date().toISOString();
+      if (runningJobId === jobId) runningJobId = null;
       if (message.includes('401') || message.includes('expired') || message.includes('CSRF')) {
         job.error = 'Session expired or invalid. Please paste a fresh cookie from Ashby.';
       } else {
@@ -607,6 +709,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
 });
 
 const handleJobStatus = (req: express.Request, res: express.Response) => {
+  cleanupOldJobs();
   const jobId = req.params.jobId as string;
   const job = jobs.get(jobId);
 
@@ -634,18 +737,18 @@ const handleJobStatus = (req: express.Request, res: express.Response) => {
       error: job.error,
       detail: job.detail,
     });
-    jobs.delete(job.id);
     return;
   }
 
-  // completed
+  // completed — keep the job until the 30-min TTL (cleanupOldJobs) instead
+  // of deleting on first read, so multiple teammates' pollers attached to
+  // the same shared-session job can each read the result.
   res.json({
     jobId: job.id,
     job_id: job.id,
     status: 'completed',
     ...job.result,
   });
-  jobs.delete(job.id);
 };
 
 app.get('/api/extract/status/:jobId', handleJobStatus);
