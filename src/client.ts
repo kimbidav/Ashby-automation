@@ -372,7 +372,7 @@ interface ApplicationsResponse {
   };
 }
 
-async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<string> {
+export async function fetchCsrfToken(session: AshbySession, retries = 2): Promise<string> {
   const url = 'https://app.ashbyhq.com/api/csrf/token';
 
   // Auth check only applies to the cookie-header path. The live
