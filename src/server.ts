@@ -77,6 +77,8 @@ interface CachedResult {
     stats: { companies: number; jobs: number; candidates: number };
     companies: any[];
     candidates: any[];
+    // Authoritative swept-org names (real client orgs, not candidate employers).
+    orgs?: string[];
   };
 }
 
@@ -488,6 +490,7 @@ function formatResult(data: ExtractResult & { extraction_stats?: Record<string, 
     },
     companies: data.companies,
     candidates: data.candidates,
+    orgs: data.orgs,
     extraction_stats: data.extraction_stats,
   };
 }

@@ -59,6 +59,12 @@ export interface ExtractResult {
   companies: Company[];
   jobs: Job[];
   candidates: ExtractedCandidate[];
+  // Names of the Ashby orgs that were actually swept this run (the real client
+  // orgs — NOT candidate employers). This is the authoritative "which companies
+  // run Ashby" list for the dashboard and the trusted set for archival
+  // inference. `companies` above is derived from each candidate's employer
+  // (app.candidate.company) and must NOT be used for org-level detection.
+  orgs: string[];
 }
 
 function eventKey(event: InterviewEvent): string {
@@ -215,6 +221,10 @@ export async function extractPipeline(
   const allJobs: Job[] = [];
   let allCandidates: Candidate[] = [];
   let orgsFetched = 0;
+  // Real client-org names that were successfully swept (includes orgs with zero
+  // candidates this run — the "Rilla case"). This, not `allCompanies` (employer
+  // names), is the authoritative Ashby-client list returned as `orgs`.
+  const sweptOrgNames = new Set<string>();
   const failedOrgs: typeof orgsWithUserId = [];
   let authDead = false;
 
@@ -237,6 +247,7 @@ export async function extractPipeline(
       allCompanies.push(...companies);
       allJobs.push(...jobs);
       allCandidates.push(...candidates);
+      if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
     } catch (err: any) {
       const msg = err?.message?.substring(0, 150) || '';
@@ -270,6 +281,7 @@ export async function extractPipeline(
         allCompanies.push(...companies);
         allJobs.push(...jobs);
         allCandidates.push(...candidates);
+        if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
         orgsFetched++;
         console.log(`  ✓ Retry ${retry} succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
       } catch (err: any) {
@@ -496,6 +508,7 @@ export async function extractPipeline(
     companies: allCompanies,
     jobs: allJobs,
     candidates: flatCandidates,
+    orgs: Array.from(sweptOrgNames),
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
       orgs_fetched: orgsFetched,
