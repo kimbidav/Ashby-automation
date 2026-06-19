@@ -87,6 +87,11 @@ export interface Candidate {
   statusPriority: number | null;
   statusDueAt: string | null;
 
+  // Archive/hire reason — populated by the bounded done-sweep (fetchArchivedForOrg)
+  // for candidates pulled from the Archived/Hired prebuilt views.
+  archivedReason?: string | null;     // e.g., "Lacks Skills/Qualifications"
+  archivedReasonType?: string | null; // e.g., "REJECTED_BY_ORG"
+
   // Enhanced fields
   primaryEmailAddress: string | null;
   phoneNumber: string | null;
