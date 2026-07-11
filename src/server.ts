@@ -126,7 +126,7 @@ function cleanupOldJobs() {
 
 // Bump on behavior changes so a curl to /api/health confirms which build a
 // deployment (e.g. Railway) is actually running.
-const BUILD_STAMP = '2026-06-12-shared-session-seed';
+const BUILD_STAMP = '2026-07-11-orgs-and-archived-sweep';
 
 app.get('/api/health', (_req: express.Request, res: express.Response) => {
   res.json({
