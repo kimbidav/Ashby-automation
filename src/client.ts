@@ -1354,6 +1354,159 @@ function normalizePipelineData(
   };
 }
 
+/**
+ * Bounded sweep of an org's DONE applications (Archived + Hired prebuilt views).
+ *
+ * Why this exists: the active sweep only requests `prebuiltView: Active`, so a
+ * candidate archived (or hired) *before* their first active sweep is never
+ * captured — they show up on the dashboard as a false "Not yet in Ashby" Slack
+ * row that's still treated as active. This pulls recently-done applications so
+ * those candidates land as real archived/hired rows and demote correctly.
+ *
+ * Lean by design: minimal field set (no interview/feedback enrichment — these
+ * are terminal), ordered by submission desc, and bounded by BOTH a recency
+ * window (`sinceDays`, matches the dashboard's 60-day lookback) and a hard page
+ * cap so a client with thousands of historical rejections can't blow the
+ * budget. The valid enum (confirmed empirically) is `ApplicationPrebuiltViewType`
+ * with values Active / Archived / Hired.
+ */
+export async function fetchArchivedForOrg(
+  session: AshbySession,
+  orgId: string,
+  userId: string | undefined,
+  orgName: string | undefined,
+  options: { sinceDays?: number; maxPages?: number; pageSize?: number } = {},
+): Promise<Candidate[]> {
+  const sinceDays = options.sinceDays ?? 60;
+  const maxPages = options.maxPages ?? 3;
+  const pageSize = options.pageSize ?? 50;
+  const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+
+  if (userId && orgId !== 'default') {
+    try {
+      await switchOrgContext(session, userId);
+    } catch (error) {
+      console.error(`  archived-sweep: failed to switch to org ${orgId}:`, error);
+      return [];
+    }
+  }
+
+  const fragment = `
+        results {
+          id
+          createdAt
+          candidate { id name company __typename }
+          job { id title __typename }
+          source { id title __typename }
+          creditedToUser { id firstName lastName email __typename }
+          applicationStatus { description priority dueAt __typename }
+          currentInterviewStage { id title stageType __typename }
+          archiveReason { id text reasonType __typename }
+          __typename
+        }
+        nextCursor
+        moreDataAvailable
+        __typename`;
+
+  const out: Candidate[] = [];
+  for (const view of ['Archived', 'Hired'] as const) {
+    const query = `
+      query ArchivedSweep($cursor: String, $limit: Int, $orderByFields: [OrderByFieldInput]) {
+        result: applicationsByPrebuiltView(
+          prebuiltView: ${view}
+          cursor: $cursor
+          limit: $limit
+          orderByFields: $orderByFields
+          searchTerm: ""
+        ) { ${fragment} }
+      }`;
+
+    let cursor: string | null = null;
+    let reachedCutoff = false;
+    for (let page = 0; page < maxPages && !reachedCutoff; page++) {
+      let data: { result: { results: any[]; nextCursor: string | null; moreDataAvailable: boolean } };
+      try {
+        data = await graphqlQuery(session, 'ArchivedSweep', query, {
+          cursor,
+          limit: pageSize,
+          orderByFields: [{ field: 'submitted_at', ascending: false }],
+        }, page === 0);
+      } catch (error: any) {
+        console.warn(`  archived-sweep (${view}, org ${orgId}): ${error?.message?.substring(0, 120)}`);
+        break;
+      }
+
+      const rows = data?.result?.results || [];
+      for (const app of rows) {
+        // Ordered newest-submitted first: once we pass the window, stop.
+        if (app?.createdAt && new Date(app.createdAt).getTime() < cutoffMs) {
+          reachedCutoff = true;
+          break;
+        }
+        const reasonText: string | null = app?.archiveReason?.text ?? null;
+        const reasonType: string | null = app?.archiveReason?.reasonType ?? null;
+        const looksHired = view === 'Hired'
+          || /hire/i.test(reasonType || '')
+          || /hire/i.test(reasonText || '');
+        const creditedTo = app?.creditedToUser
+          ? `${app.creditedToUser.firstName} ${app.creditedToUser.lastName}`.trim() || app.creditedToUser.email
+          : null;
+        const lastActivityAt = app?.createdAt || '';
+
+        out.push({
+          id: app?.candidate?.id,
+          applicationId: app?.id,
+          name: app?.candidate?.name,
+          email: null,
+          phone: null,
+          currentStage: app?.applicationStatus?.description || (looksHired ? 'Hired' : 'Archived'),
+          currentStageId: app?.currentInterviewStage?.id || null,
+          currentStageEnteredAt: null,
+          pipelineStage: app?.currentInterviewStage?.title || null,
+          // Keep a non-null stageType so the dashboard treats this as a real
+          // Ashby record (stage_type="" marks Slack-only placeholders). Falls
+          // back to "Archived"/"Hired" when Ashby drops currentInterviewStage.
+          stageType: app?.currentInterviewStage?.stageType || (looksHired ? 'Hired' : 'Archived'),
+          currentStageIndex: null,
+          totalStages: null,
+          stageProgress: null,
+          jobId: app?.job?.id,
+          companyId: `company-${app?.candidate?.company || orgName || orgId}`,
+          orgId,
+          orgName,
+          lastActivityAt,
+          daysInStage: lastActivityAt ? computeDaysInStage(lastActivityAt) : 0,
+          needsScheduling: false,
+          creditedTo,
+          source: app?.source?.title || null,
+          decisionStatus: looksHired ? 'Hired' : 'Archived',
+          statusPriority: app?.applicationStatus?.priority ?? null,
+          statusDueAt: app?.applicationStatus?.dueAt ?? null,
+          archivedReason: reasonText,
+          archivedReasonType: reasonType,
+          primaryEmailAddress: null,
+          phoneNumber: null,
+          location: null,
+          resumeUrl: null,
+          linkedInUrl: null,
+          githubUrl: null,
+          websiteUrl: null,
+          interviewEvents: [],
+          allFeedback: [],
+          latestOverallRecommendation: null,
+          feedbackCount: 0,
+        });
+      }
+
+      if (reachedCutoff || !data?.result?.moreDataAvailable || !data?.result?.nextCursor) break;
+      cursor = data.result.nextCursor;
+    }
+  }
+
+  if (out.length > 0) console.log(`  archived-sweep (org ${orgName || orgId}): ${out.length} done rows`);
+  return out;
+}
+
 function computeDaysInStage(lastActivityAt: string): number {
   const last = new Date(lastActivityAt).getTime();
   const now = Date.now();

@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -35,6 +35,8 @@ export interface ExtractedCandidate {
   org_id: string;
   pipeline_stage: string;
   decision_status: string;
+  archived_reason?: string;
+  archived_reason_type?: string;
   stage_type: string;
   current_stage_index: number | null;
   total_stages: number | null;
@@ -59,6 +61,12 @@ export interface ExtractResult {
   companies: Company[];
   jobs: Job[];
   candidates: ExtractedCandidate[];
+  // Names of the Ashby orgs that were actually swept this run (the real client
+  // orgs — NOT candidate employers). This is the authoritative "which companies
+  // run Ashby" list for the dashboard and the trusted set for archival
+  // inference. `companies` above is derived from each candidate's employer
+  // (app.candidate.company) and must NOT be used for org-level detection.
+  orgs: string[];
 }
 
 function eventKey(event: InterviewEvent): string {
@@ -174,6 +182,13 @@ const EXTRACT_BUDGET_MS = parseInt(process.env.ASHBY_EXTRACT_BUDGET_SEC || '240'
 // least this much time. Set to 0 to restore the old leftovers-only behavior.
 const ENRICH_MIN_BUDGET_MS = parseInt(process.env.ASHBY_ENRICH_MIN_BUDGET_SEC || '180', 10) * 1000;
 
+// Bounded done-sweep (Archived + Hired prebuilt views) alongside the active
+// sweep, so a candidate archived/hired before their first active sweep is
+// still captured and demotes correctly instead of showing a false "Not yet in
+// Ashby" Slack row. On by default; set ASHBY_INCLUDE_ARCHIVED=0 to disable.
+const INCLUDE_ARCHIVED = !['0', 'false', 'no'].includes((process.env.ASHBY_INCLUDE_ARCHIVED || '1').toLowerCase());
+const ARCHIVED_LOOKBACK_DAYS = parseInt(process.env.ASHBY_ARCHIVED_LOOKBACK_DAYS || '60', 10);
+
 export function getOrgCacheStats() {
   let cachedOrgs = 0;
   let cachedCandidates = 0;
@@ -215,8 +230,26 @@ export async function extractPipeline(
   const allJobs: Job[] = [];
   let allCandidates: Candidate[] = [];
   let orgsFetched = 0;
+  // Real client-org names that were successfully swept (includes orgs with zero
+  // candidates this run — the "Rilla case"). This, not `allCompanies` (employer
+  // names), is the authoritative Ashby-client list returned as `orgs`.
+  const sweptOrgNames = new Set<string>();
   const failedOrgs: typeof orgsWithUserId = [];
   let authDead = false;
+
+  // Bounded done-sweep for one org (Archived + Hired views). Non-fatal: an
+  // archived-sweep failure must never drop the org's active candidates.
+  const sweepDoneForOrg = async (orgInfo: (typeof orgsWithUserId)[number]) => {
+    if (!INCLUDE_ARCHIVED) return;
+    try {
+      const done = await fetchArchivedForOrg(session, orgInfo.id, orgInfo.userId, orgInfo.name, {
+        sinceDays: ARCHIVED_LOOKBACK_DAYS,
+      });
+      if (done.length) allCandidates.push(...done);
+    } catch (err: any) {
+      console.warn(`  [${orgInfo.name}] archived-sweep failed (non-fatal): ${err?.message?.substring(0, 120)}`);
+    }
+  };
 
   // ── Pass 1: fetch all orgs ─────────────────────────────────────────────
   for (let i = 0; i < orgsWithUserId.length; i++) {
@@ -237,7 +270,9 @@ export async function extractPipeline(
       allCompanies.push(...companies);
       allJobs.push(...jobs);
       allCandidates.push(...candidates);
+      if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
+      await sweepDoneForOrg(orgInfo);
     } catch (err: any) {
       const msg = err?.message?.substring(0, 150) || '';
       console.error(`  [${orgInfo.name}] Failed: ${msg}`);
@@ -270,7 +305,9 @@ export async function extractPipeline(
         allCompanies.push(...companies);
         allJobs.push(...jobs);
         allCandidates.push(...candidates);
+        if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
         orgsFetched++;
+        await sweepDoneForOrg(orgInfo);
         console.log(`  ✓ Retry ${retry} succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
       } catch (err: any) {
         console.error(`  ✗ Retry ${retry} failed for ${orgInfo.name}: ${err?.message?.substring(0, 100)}`);
@@ -311,8 +348,13 @@ export async function extractPipeline(
         'booking link sent',
         'needs scheduling',
       ]);
+      const DONE_STATUS = new Set(['archived', 'hired', 'closed', 'rejected']);
       const shouldEnrich = (c: Candidate): boolean => {
         const status = (c.decisionStatus || '').trim().toLowerCase();
+        // Done rows (from the bounded archived/hired sweep) are terminal — never
+        // enrich them, or the `stageType && no events` branch below would burn
+        // the enrichment budget on every archived candidate.
+        if (DONE_STATUS.has(status)) return false;
         if (SUSPECT_STATUS.has(status)) return true;
         // Catch records where bulk fetch returned zero events but the
         // candidate looks active — likely missing data.
@@ -451,6 +493,8 @@ export async function extractPipeline(
       org_id: cand.orgId ?? '',
       pipeline_stage: cand.pipelineStage ?? '',
       decision_status: cand.decisionStatus ?? '',
+      archived_reason: cand.archivedReason ?? '',
+      archived_reason_type: cand.archivedReasonType ?? '',
       stage_type: cand.stageType ?? '',
       current_stage_index: cand.currentStageIndex,
       total_stages: cand.totalStages,
@@ -496,6 +540,7 @@ export async function extractPipeline(
     companies: allCompanies,
     jobs: allJobs,
     candidates: flatCandidates,
+    orgs: Array.from(sweptOrgNames),
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
       orgs_fetched: orgsFetched,
