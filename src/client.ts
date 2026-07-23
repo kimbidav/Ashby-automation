@@ -285,6 +285,7 @@ interface ApplicationResult {
     id: string;
     name: string;
     company: string | null;
+    socialLinks?: Array<{ type: string; url: string; __typename?: string }> | null;
     isBlinded: boolean;
     __typename: string;
   };
@@ -1335,7 +1336,7 @@ function normalizePipelineData(
       phoneNumber: null,
       location: null,
       resumeUrl: null,
-      linkedInUrl: null,
+      linkedInUrl: linkedInFromSocialLinks(app.candidate.socialLinks),
       githubUrl: null,
       websiteUrl: null,
       interviewEvents,
@@ -1395,7 +1396,7 @@ export async function fetchArchivedForOrg(
         results {
           id
           createdAt
-          candidate { id name company __typename }
+          candidate { id name company socialLinks { type url __typename } __typename }
           job { id title __typename }
           source { id title __typename }
           creditedToUser { id firstName lastName email __typename }
@@ -1488,7 +1489,7 @@ export async function fetchArchivedForOrg(
           phoneNumber: null,
           location: null,
           resumeUrl: null,
-          linkedInUrl: null,
+          linkedInUrl: linkedInFromSocialLinks(app?.candidate?.socialLinks),
           githubUrl: null,
           websiteUrl: null,
           interviewEvents: [],
@@ -1505,6 +1506,23 @@ export async function fetchArchivedForOrg(
 
   if (out.length > 0) console.log(`  archived-sweep (org ${orgName || orgId}): ${out.length} done rows`);
   return out;
+}
+
+// Candidate identity: pull the LinkedIn profile URL out of Ashby's
+// socialLinks. The dashboard uses it to join a candidate across sources
+// when the display names differ ("Dan Clark" in Slack vs "Daniel Clark"
+// in Ashby point at the same linkedin.com/in/... profile).
+function linkedInFromSocialLinks(
+  links?: Array<{ type?: string; url?: string }> | null
+): string | null {
+  for (const link of links || []) {
+    const type = (link.type || '').toLowerCase();
+    const url = link.url || '';
+    if (type.includes('linkedin') || /linkedin\.com/i.test(url)) {
+      return url || null;
+    }
+  }
+  return null;
 }
 
 function computeDaysInStage(lastActivityAt: string): number {

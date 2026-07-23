@@ -18,3 +18,4 @@ test-output.json
 
 # GraphQL query files (auto-generated/internal)
 query_*.graphql
+gcal_token.json

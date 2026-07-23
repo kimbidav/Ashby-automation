@@ -31,6 +31,9 @@ export interface ExtractedCandidate {
   job_id: string;
   candidate_name: string;
   candidate_id: string;
+  // LinkedIn profile URL from Ashby's socialLinks — the cross-source identity
+  // key. Empty string when Ashby has no LinkedIn on file.
+  linkedin_url: string;
   application_id: string;
   org_id: string;
   pipeline_stage: string;
@@ -487,6 +490,7 @@ export async function extractPipeline(
       job_id: cand.jobId,
       candidate_name: cand.name,
       candidate_id: cand.id,
+      linkedin_url: cand.linkedInUrl ?? '',
       // Identity for targeted lookups after the candidate leaves the active
       // pipeline (archived/hired verification needs the application + org).
       application_id: cand.applicationId ?? '',
