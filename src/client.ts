@@ -644,13 +644,13 @@ export async function fetchPipelineForOrg(
       await switchOrgContext(session, userId);
       switchedOrg = true;
     } catch (error) {
+      // Re-throw so the sweep loop counts this org as FAILED, not as
+      // "swept with zero candidates". Swallowing the error here made a
+      // 401'd sweep report every org as successfully swept, which the
+      // backend's archival inference then read as "all these candidates
+      // left the pipeline" — mass false archival (2026-07-28 incident).
       console.error(`  Failed to switch to org ${orgId}:`, error);
-      // Return empty result if we can't switch
-      return {
-        companies: [],
-        jobs: [],
-        candidates: []
-      };
+      throw error;
     }
   }
   
