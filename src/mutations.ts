@@ -207,13 +207,21 @@ export async function fetchSourceIdByTitle(
   session: AshbySession,
   title: string,
 ): Promise<{ id: string; displayTitle: string } | null> {
-  const resp = await graphqlReadQuery<{
-    results: Array<{ id: string; displayTitle: string }>;
-  }>(session, 'ApiSearchSourceByTitle', SEARCH_SOURCE_BY_TITLE, { title, activeOnly: true });
-  const results = resp?.results || [];
+  // Every org names the agency source differently — observed live:
+  // "Sourced: Candidate Labs" (Reducto), "Agencies: Candidate Labs"
+  // (AfterQuery), "Agency - Candidate Labs" (Trajectory). Searching the
+  // exact preferred title returns nothing in orgs using a variant, so
+  // search by the stable substring and rank: exact preferred title first,
+  // then any title containing "candidate labs".
+  const search = async (q: string) => {
+    const resp = await graphqlReadQuery<{
+      results: Array<{ id: string; displayTitle: string }>;
+    }>(session, 'ApiSearchSourceByTitle', SEARCH_SOURCE_BY_TITLE, { title: q, activeOnly: true });
+    return resp?.results || [];
+  };
+  let results = await search('Candidate Labs');
+  if (results.length === 0) results = await search(title);
   const wanted = title.trim().toLowerCase();
-  // Prefer an exact displayTitle match ("Sourced: Candidate Labs"), else the
-  // first hit whose title contains the search term.
   return (
     results.find((r) => (r.displayTitle || '').trim().toLowerCase() === wanted) ||
     results.find((r) => (r.displayTitle || '').toLowerCase().includes('candidate labs')) ||
