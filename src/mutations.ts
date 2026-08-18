@@ -209,23 +209,30 @@ export async function fetchSourceIdByTitle(
 ): Promise<{ id: string; displayTitle: string } | null> {
   // Every org names the agency source differently — observed live:
   // "Sourced: Candidate Labs" (Reducto), "Agencies: Candidate Labs"
-  // (AfterQuery), "Agency - Candidate Labs" (Trajectory). Searching the
-  // exact preferred title returns nothing in orgs using a variant, so
-  // search by the stable substring and rank: exact preferred title first,
-  // then any title containing "candidate labs".
+  // (AfterQuery/Luminai), "Agency - Candidate Labs" (Trajectory). And
+  // searchSourceByTitle matches by PREFIX, so "Candidate Labs" misses every
+  // variant that puts a category word first. Search several prefixes,
+  // collect, and rank: exact preferred title, then any title containing
+  // "candidate labs".
   const search = async (q: string) => {
     const resp = await graphqlReadQuery<{
       results: Array<{ id: string; displayTitle: string }>;
     }>(session, 'ApiSearchSourceByTitle', SEARCH_SOURCE_BY_TITLE, { title: q, activeOnly: true });
     return resp?.results || [];
   };
-  let results = await search('Candidate Labs');
-  if (results.length === 0) results = await search(title);
+  const byId = new Map<string, { id: string; displayTitle: string }>();
+  for (const term of [title, 'Candidate Labs', 'Sourced', 'Agencies', 'Agency']) {
+    try {
+      for (const r of await search(term)) byId.set(r.id, r);
+    } catch { /* try remaining prefixes */ }
+    // Stop early once a candidate-labs source is on hand.
+    if ([...byId.values()].some((r) => (r.displayTitle || '').toLowerCase().includes('candidate labs'))) break;
+  }
+  const results = [...byId.values()];
   const wanted = title.trim().toLowerCase();
   return (
     results.find((r) => (r.displayTitle || '').trim().toLowerCase() === wanted) ||
     results.find((r) => (r.displayTitle || '').toLowerCase().includes('candidate labs')) ||
-    results[0] ||
     null
   );
 }
@@ -443,19 +450,37 @@ export async function createApplicationForCandidate(
 }
 
 /**
- * Plain text → Ashby's rich-text note envelope (version "2", the exact shape
- * the bundle's own plain-text converter emits). Paragraph per line; blank
- * lines become empty paragraphs so the Slack write-up's spacing survives.
+ * Plain text → Ashby's rich-text note envelope, captured 2026-08-18 from a
+ * live ApiAddNoteToCandidate request the web UI sent (fetch-intercepted):
+ * text nodes are BASE64-encoded with attrs.encoding="base64" — plain text
+ * nodes draw an unhandled server error — and the envelope carries the
+ * editor's feature list plus attachments/metadata blocks. Paragraph per
+ * line; blank lines become empty paragraphs so Slack spacing survives.
  */
+const NOTE_FEATURES = [
+  'AiContentAssistant', 'Unimplemented', 'Placeholder', 'Italic', 'Bold',
+  'Underline', 'Code', 'CodeBlocks', 'Headings', 'NumberedLists',
+  'BulletedLists', 'Links', 'Blockquote', 'Mentions', 'Table',
+  'InternalImages', 'EmptyDivAsParagraph',
+];
+
 export function noteContentFromPlainText(text: string): Record<string, unknown> {
   const paragraphs = text.split('\n').map((line) => ({
     type: 'paragraph',
-    content: line.length > 0 ? [{ type: 'text', text: line }] : [],
+    content: line.length > 0
+      ? [{
+          type: 'text',
+          text: Buffer.from(line, 'utf8').toString('base64'),
+          attrs: { encoding: 'base64' },
+        }]
+      : [],
   }));
   return {
     version: '2',
     content: { type: 'doc', content: paragraphs },
-    features: [],
+    features: NOTE_FEATURES,
+    attachments: [],
+    metadata: { mentions: { users: [] }, tasks: [] },
   };
 }
 
