@@ -129,6 +129,40 @@ ASHBY_RESTRICTED_PROBE_MAX_PER_ORG   # per-org probe cap (default 25); rows past
                                      # are emitted unprobed (logged)
 ```
 
+## Write Support (Add-to-Ashby)
+
+`src/mutations.ts` holds the write operations for the dashboard's Add-to-Ashby flow —
+every document mined from the frontend bundle (hash 4086bb13, 2026-08-18). Shapes worth
+remembering: `addCandidate` takes NO arguments (blank create, then `updateCandidate`
+per-field setters — name, emailAddresses, socialLinks type `"LINKEDIN"`, sourceId,
+creditedTo); resume upload is presigned-POST (`createFileUploadHandle` →
+multipart to the storage URL: Content-Type first, `fields` entries, `file` last →
+`uploadCandidateResume(resumeHandle, candidateId)`); `createApplication` takes
+sourceId/creditedToUserId at create time; `addNoteToCandidate` content is the
+version-"2" rich-text envelope (`{version:"2", content:{type:"doc", content:[paragraph
+nodes]}, features:[]}`).
+
+Safety rails: all mutations run via `graphqlMutation` (retries=0 — the read path's
+auto-retry would double-execute a write); every write path enters the org through
+`enterOrgContext` (switch + eager CSRF refresh + verify-or-throw `wrong_org_context`);
+and `src/write-lock.ts` serializes ALL session use (extract, archive-status, writes) —
+org context is server-side per session, so a write racing a sweep's `change_user` calls
+would land data in the wrong client's ATS.
+
+Endpoints (`/api/applications/*`, behind `requireSecret` on Railway):
+- `POST /api/applications/open-jobs` `{org_name}` → open jobs + "Sourced: Candidate
+  Labs" source id + per-org credited-to user id (the org's own `userId` from
+  available_identities).
+- `POST /api/applications/add-candidate` → duplicate pre-check (LinkedIn slug, then
+  exact name) 409s BEFORE any write; candidate create is the point of no return;
+  resume/application/note failures return 200 + a per-step status map and the caller
+  retries with `existing_candidate_id`; caches invalidated after any write. Route has
+  its own 15mb JSON limit for the base64 resume.
+
+`src/write-discovery.ts` is the read-only validation harness (org guard, open jobs,
+source resolution, candidate search, social-link enum) — run it after Ashby ships
+frontend changes if writes start failing.
+
 ## GraphQL Queries Used
 
 | Operation Name | Endpoint | Purpose |
