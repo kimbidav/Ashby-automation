@@ -96,6 +96,15 @@ mutation ApiUploadCandidateResume($resumeHandle: String!, $candidateId: String!)
   }
 }`;
 
+const PUBLISH_CANDIDATE = `
+mutation ApiPublishCandidate($candidateId: String!) {
+  candidate: publishCandidate(id: $candidateId) {
+    id
+    isDraft
+    isPublished
+  }
+}`;
+
 const CREATE_APPLICATION = `
 mutation ApiCreateApplication($candidateId: String!, $jobId: String!, $interviewPlanId: String, $initialInterviewStageId: String, $sourceId: String, $sourceSite: SourceSite, $creditedToUserId: String) {
   application: createApplication(
@@ -418,6 +427,27 @@ export async function fetchJobEntryStage(
     initialInterviewStageId: entry.id,
     stageTitle: entry.title,
   };
+}
+
+/**
+ * THE step everything else hinged on: addCandidate creates an UNPUBLISHED
+ * DRAFT. Draft candidates are invisible to search, duplicate detection, and
+ * candidate pages, and createApplication dies on them with an unhandled
+ * server error. The UI publishes on the Add panel's "Next" click
+ * (`candidate.isPublished ? navigate : publish()`); we publish after the
+ * field setters. Idempotent-safe to call on an already-published candidate.
+ */
+export async function publishCandidate(
+  session: AshbySession,
+  candidateId: string,
+): Promise<{ isPublished: boolean }> {
+  const resp = await graphqlMutation<{ candidate: { id: string; isDraft: boolean; isPublished: boolean } }>(
+    session,
+    'ApiPublishCandidate',
+    PUBLISH_CANDIDATE,
+    { candidateId },
+  );
+  return { isPublished: resp?.candidate?.isPublished === true };
 }
 
 /**

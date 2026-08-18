@@ -32,6 +32,7 @@ import {
   searchCandidatesInOrg,
   fetchSourceIdByTitle,
   createCandidateWithDetails,
+  publishCandidate,
   uploadResumeForCandidate,
   createApplicationForCandidate,
   fetchJobEntryStage,
@@ -663,7 +664,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       const reassertOrg = () => enterOrgContext(session, org.userId, org.name);
 
       const warnings: string[] = [];
-      const steps: Record<string, string> = { candidate: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
+      const steps: Record<string, string> = { candidate: 'pending', publish: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
       const normLi = (u: string) =>
         (u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('?')[0].replace(/\/+$/, '');
 
@@ -714,6 +715,18 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
         candidateId = created.candidateId;
         warnings.push(...created.warnings);
         steps.candidate = 'created';
+      }
+
+      // Publish — addCandidate leaves the record as an invisible DRAFT
+      // (hidden from search, dup detection, and candidate pages), and
+      // createApplication dies on drafts. Runs on the retry path too so
+      // pre-fix orphan drafts get healed. Idempotent on published records.
+      try {
+        await publishCandidate(session, candidateId);
+        steps.publish = 'published';
+      } catch (err: any) {
+        steps.publish = 'failed';
+        warnings.push(`publish failed: ${err?.message?.substring(0, 120)}`);
       }
 
       // Resume — non-fatal.
