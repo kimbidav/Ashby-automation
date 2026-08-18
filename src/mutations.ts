@@ -420,15 +420,27 @@ export async function fetchJobEntryStage(
   };
 }
 
+/**
+ * Variables mirror the UI's exact payload, mined from the bundle's
+ * "Consider Candidate for Job?" panel (2026-08-18):
+ *   { candidateId, jobId, interviewPlanId: <plan id>,
+ *     initialInterviewStageId: null, sourceId, sourceSite: null,
+ *     creditedToUserId }
+ * Two hard requirements the server enforces with an unhandled error:
+ * interviewPlanId must be PRESENT (the panel always supplies the default
+ * plan), and initialInterviewStageId must be NULL for external-recruiter
+ * seats — the panel hides the stage selector for that role
+ * (showInterviewStageSelect: globalRole !== ExternalRecruiter), so a
+ * caller-chosen stage id is rejected server-side.
+ */
 export async function createApplicationForCandidate(
   session: AshbySession,
   input: {
     candidateId: string;
     jobId: string;
+    interviewPlanId: string;
     sourceId?: string | null;
     creditedToUserId?: string | null;
-    interviewPlanId?: string | null;
-    initialInterviewStageId?: string | null;
   },
 ): Promise<{ applicationId: string }> {
   const resp = await graphqlMutation<{ application: { id: string } }>(
@@ -438,9 +450,10 @@ export async function createApplicationForCandidate(
     {
       candidateId: input.candidateId,
       jobId: input.jobId,
-      interviewPlanId: input.interviewPlanId ?? null,
-      initialInterviewStageId: input.initialInterviewStageId ?? null,
+      interviewPlanId: input.interviewPlanId,
+      initialInterviewStageId: null,
       sourceId: input.sourceId ?? null,
+      sourceSite: null,
       creditedToUserId: input.creditedToUserId ?? null,
     },
   );

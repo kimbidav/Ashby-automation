@@ -750,21 +750,19 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
           } catch { /* fall through to create */ }
         }
         if (!applicationId) {
-          // The manual flow always supplies the job's interview plan and an
-          // entry stage; omitting them draws an unhandled server error.
-          let plan: { interviewPlanId: string; initialInterviewStageId: string; stageTitle: string } | null = null;
-          try {
-            plan = await fetchJobEntryStage(session, jobId);
-          } catch (err: any) {
-            console.warn(`  add-candidate: entry-stage lookup failed: ${err?.message?.substring(0, 120)}`);
+          // interviewPlanId is REQUIRED (the UI panel always supplies the
+          // job's default plan); the stage must stay null for this seat —
+          // see createApplicationForCandidate.
+          const plan = await fetchJobEntryStage(session, jobId);
+          if (!plan?.interviewPlanId) {
+            throw new Error(`no interview plan found for job ${jobId} — cannot create application`);
           }
           const created = await createApplicationForCandidate(session, {
             candidateId,
             jobId,
+            interviewPlanId: plan.interviewPlanId,
             sourceId,
             creditedToUserId,
-            interviewPlanId: plan?.interviewPlanId ?? null,
-            initialInterviewStageId: plan?.initialInterviewStageId ?? null,
           });
           applicationId = created.applicationId;
           steps.application = 'created';
