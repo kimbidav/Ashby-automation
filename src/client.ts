@@ -498,6 +498,12 @@ async function graphqlQuery<T>(
       }
 
       console.error(`GraphQL errors for ${operationName}:`, errorMessages);
+      if (retries === 0) {
+        // Mutation path (writes run with retries=0): the message string
+        // alone ("Unidentified server error") is useless for debugging —
+        // dump the full error objects including extensions.
+        console.error(`  full errors for ${operationName}:`, JSON.stringify(response.errors).substring(0, 1000));
+      }
       throw new Error(`GraphQL errors: ${errorMessages}`);
     }
 
@@ -505,6 +511,108 @@ async function graphqlQuery<T>(
   }
 
   throw new Error('Unreachable code in graphqlQuery');
+}
+
+/**
+ * Mutation-safe GraphQL executor. Identical transport to graphqlQuery but
+ * with retries pinned to 0: the read path's auto-retry on transient errors
+ * would double-execute a write (duplicate candidate, duplicate note). CSRF
+ * self-heal on 403 is retained inside graphqlQuery's first attempt only.
+ */
+export async function graphqlMutation<T>(
+  session: AshbySession,
+  operationName: string,
+  query: string,
+  variables: Record<string, unknown> = {},
+): Promise<T> {
+  return graphqlQuery<T>(session, operationName, query, variables, false, 0);
+}
+
+/**
+ * Read-query executor for modules outside this file (mutations.ts's dup
+ * pre-check and source lookup). Same transport and retry semantics as the
+ * internal read path.
+ */
+export async function graphqlReadQuery<T>(
+  session: AshbySession,
+  operationName: string,
+  query: string,
+  variables: Record<string, unknown> = {},
+): Promise<T> {
+  return graphqlQuery<T>(session, operationName, query, variables);
+}
+
+/**
+ * Switch into an org's context and VERIFY the switch landed where intended.
+ * Every write path must go through this: org context is server-side state on
+ * Ashby's end, and a mis-switch (or a race with another request) would land
+ * candidate data in the wrong client's ATS. Throws `wrong_org_context`
+ * when the post-switch session reports a different org.
+ */
+export async function enterOrgContext(
+  session: AshbySession,
+  userId: string,
+  expectedOrgName: string,
+): Promise<{ orgId: string; orgName: string }> {
+  await switchOrgContext(session, userId); // refreshes CSRF eagerly inside
+  const verifyQuery = `
+    query ApiGetSessionUser {
+      user: sessionUserV2 {
+        id
+        organizationId
+        organizationName
+        __typename
+      }
+    }`;
+  const resp = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
+    session,
+    'ApiGetSessionUser',
+    verifyQuery,
+  );
+  const actual = (resp?.user?.organizationName || '').trim();
+  if (actual.toLowerCase() !== expectedOrgName.trim().toLowerCase()) {
+    throw new Error(
+      `wrong_org_context: expected "${expectedOrgName}" but session is in "${actual || 'unknown'}" — aborting before any write`,
+    );
+  }
+  return { orgId: resp.user.organizationId, orgName: actual };
+}
+
+/**
+ * Live open-jobs list for the CURRENT org context (call enterOrgContext
+ * first). Trimmed from the InitialFetch document — no application sweep,
+ * fresh every call. Powers the Add-to-Ashby modal's job picker.
+ */
+export async function fetchOpenJobsForOrg(
+  session: AshbySession,
+): Promise<Array<{ id: string; title: string; locationName: string | null; applicationCount: number }>> {
+  const query = `
+    query ApiOpenJobs {
+      jobsPipelines(onlyIncludeOpenJobs: true, onlyIncludeJobsUserFollowsOrHasRole: false) {
+        jobId
+        jobTitle
+        jobLocationName
+        applicationCount
+        __typename
+      }
+    }`;
+  // Ashby's first jobsPipelines hit after an org switch can exceed the 15s
+  // transport timeout (same transient the sweep retries whole orgs for).
+  // This is a read — one retry on abort is safe and keeps the modal usable.
+  let resp: { jobsPipelines: Array<{ jobId: string; jobTitle: string; jobLocationName: string | null; applicationCount: number }> };
+  try {
+    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+  } catch (err: any) {
+    if (err?.type !== 'aborted' && !/abort/i.test(err?.message || '')) throw err;
+    console.warn('  open-jobs: request timed out, retrying once...');
+    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+  }
+  return (resp?.jobsPipelines || []).map((j) => ({
+    id: j.jobId,
+    title: j.jobTitle,
+    locationName: j.jobLocationName ?? null,
+    applicationCount: j.applicationCount ?? 0,
+  }));
 }
 
 export interface OrgInfo {
@@ -644,13 +752,13 @@ export async function fetchPipelineForOrg(
       await switchOrgContext(session, userId);
       switchedOrg = true;
     } catch (error) {
+      // Re-throw so the sweep loop counts this org as FAILED, not as
+      // "swept with zero candidates". Swallowing the error here made a
+      // 401'd sweep report every org as successfully swept, which the
+      // backend's archival inference then read as "all these candidates
+      // left the pipeline" — mass false archival (2026-07-28 incident).
       console.error(`  Failed to switch to org ${orgId}:`, error);
-      // Return empty result if we can't switch
-      return {
-        companies: [],
-        jobs: [],
-        candidates: []
-      };
+      throw error;
     }
   }
   
@@ -1506,6 +1614,75 @@ export async function fetchArchivedForOrg(
 
   if (out.length > 0) console.log(`  archived-sweep (org ${orgName || orgId}): ${out.length} done rows`);
   return out;
+}
+
+export interface CandidateRestrictedAppSummary {
+  applicationId: string;
+  jobId: string | null;
+  jobTitle: string | null;
+  stageTitle: string | null;
+  stageType: string | null;
+  enteredStageAt: string | null;
+  lastActivityAt: string | null;
+  archiveReasonText: string | null;
+  hasAccess: boolean;
+}
+
+/**
+ * Candidate-level "Considered For Jobs" list — crucially includes
+ * applications on jobs the session user has NO access to, which never appear
+ * in any prebuilt-view sweep (Active/Archived/Hired are all permission
+ * scoped). This is the same data the Ashby UI uses to render
+ * "Backend/AI Engineer (No access) — Onsite" on a candidate profile.
+ *
+ * The done-sweep uses it to avoid presenting a candidate as archived at an
+ * org where a parallel restricted application is still live (the Charles
+ * Lin @ Reducto case: Product Engineer app archived, Backend/AI Engineer
+ * app at Onsite on a no-access job — the pair is live, not done).
+ *
+ * Caller must already be in the owning org's context.
+ */
+export async function fetchCandidateRestrictedSummaries(
+  session: AshbySession,
+  candidateId: string,
+): Promise<CandidateRestrictedAppSummary[]> {
+  const query = `
+    query ApiCandidateRestrictedSummaries($id: String!) {
+      candidate(id: $id) {
+        id
+        applicationRestrictedSummaries {
+          summary {
+            id
+            job { id title __typename }
+            currentInterviewStage { id title stageType __typename }
+            archiveReason { id text __typename }
+            lastActivityAt
+            currentHistoryEvent { id enteredStageAt __typename }
+            __typename
+          }
+          userHasPermissionToAccess
+          __typename
+        }
+        __typename
+      }
+    }`;
+  const data = await graphqlQuery<{
+    candidate: { applicationRestrictedSummaries: any[] } | null;
+  }>(session, 'ApiCandidateRestrictedSummaries', query, { id: candidateId });
+  const entries = data?.candidate?.applicationRestrictedSummaries || [];
+  return entries
+    .filter((e) => e?.summary?.id)
+    .map((e) => ({
+      applicationId: e.summary.id,
+      jobId: e.summary.job?.id ?? null,
+      jobTitle: e.summary.job?.title ?? null,
+      stageTitle: e.summary.currentInterviewStage?.title ?? null,
+      stageType: e.summary.currentInterviewStage?.stageType ?? null,
+      enteredStageAt: e.summary.currentHistoryEvent?.enteredStageAt ?? null,
+      lastActivityAt: e.summary.lastActivityAt ?? null,
+      archiveReasonText: e.summary.archiveReason?.text ?? null,
+      hasAccess: e.userHasPermissionToAccess !== false,
+    }));
 }
 
 // Candidate identity: pull the LinkedIn profile URL out of Ashby's

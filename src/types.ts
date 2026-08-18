@@ -92,6 +92,17 @@ export interface Candidate {
   archivedReason?: string | null;     // e.g., "Lacks Skills/Qualifications"
   archivedReasonType?: string | null; // e.g., "REJECTED_BY_ORG"
 
+  // Job title carried directly on the row. Set by the done-sweep's
+  // restricted-application path, where the job may be absent from
+  // jobsPipelines (no-access jobs aren't listed there) so the usual
+  // jobId → title lookup would miss. The flat mapping falls back to this.
+  jobTitle?: string | null;
+  // True when this row was built from a restricted-application summary:
+  // the session user cannot open the application, so interview events,
+  // feedback, and scheduling status are invisible — only the job title and
+  // current stage are known.
+  accessRestricted?: boolean;
+
   // Enhanced fields
   primaryEmailAddress: string | null;
   phoneNumber: string | null;
