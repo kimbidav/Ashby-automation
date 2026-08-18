@@ -132,15 +132,30 @@ ASHBY_RESTRICTED_PROBE_MAX_PER_ORG   # per-org probe cap (default 25); rows past
 ## Write Support (Add-to-Ashby)
 
 `src/mutations.ts` holds the write operations for the dashboard's Add-to-Ashby flow —
-every document mined from the frontend bundle (hash 4086bb13, 2026-08-18). Shapes worth
-remembering: `addCandidate` takes NO arguments (blank create, then `updateCandidate`
-per-field setters — name, emailAddresses, socialLinks type `"LINKEDIN"`, sourceId,
-creditedTo); resume upload is presigned-POST (`createFileUploadHandle` →
-multipart to the storage URL: Content-Type first, `fields` entries, `file` last →
-`uploadCandidateResume(resumeHandle, candidateId)`); `createApplication` takes
-sourceId/creditedToUserId at create time; `addNoteToCandidate` content is the
-version-"2" rich-text envelope (`{version:"2", content:{type:"doc", content:[paragraph
-nodes]}, features:[]}`).
+every document mined from the frontend bundle (hash 4086bb13, 2026-08-18), with the
+sharp edges confirmed live on 2026-08-18 by intercepting the web UI's own requests.
+Shapes that MUST be respected (each one cost a debugging session):
+- **`addCandidate` takes NO arguments and creates an UNPUBLISHED DRAFT.** Draft
+  candidates are invisible to search, duplicate detection, and candidate pages, and
+  `createApplication` dies on them with an unhandled "Unidentified server error" —
+  **`publishCandidate(id)` must run after the field setters** (the UI publishes on the
+  Add panel's "Next" click via `candidate.isPublished ? navigate : publish()`).
+- `updateCandidate` per-field setters: emailAddresses type is `"personal"`
+  (lowercase); socialLinks type is `"LINKEDIN"` (uppercase).
+- `createApplication` variables must mirror the Consider-for-Job panel exactly:
+  `interviewPlanId` PRESENT (the job's default plan), `initialInterviewStageId` NULL
+  for external-recruiter seats (the panel hides the stage selector for that role —
+  a caller-chosen stage id is rejected server-side), `sourceSite` explicit null.
+  The server then lands the application at the plan's entry stage itself.
+- `addNoteToCandidate` content is the version-"2" rich-text envelope with text nodes
+  **base64-encoded** (`attrs.encoding="base64"`), the editor's feature list, and
+  `attachments`/`metadata` blocks — plain text nodes draw the server error.
+- Source titles vary per org ("Sourced: Candidate Labs" / "Agencies: Candidate Labs" /
+  "Agency - Candidate Labs") and `searchSourceByTitle` matches by PREFIX — search
+  several prefixes and pick the title containing "candidate labs".
+- Resume upload is presigned-POST (`createFileUploadHandle` → multipart to the storage
+  URL: Content-Type first, `fields` entries, `file` last →
+  `uploadCandidateResume(resumeHandle, candidateId)`).
 
 Safety rails: all mutations run via `graphqlMutation` (retries=0 — the read path's
 auto-retry would double-execute a write); every write path enters the org through
