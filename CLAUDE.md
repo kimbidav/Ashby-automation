@@ -92,6 +92,42 @@ The fallback query still includes: candidate info, job/stage data, interview eve
 - `graphqlQuery<T>(session, operationName, query, variables, forceRefreshCsrf, retries)` — low-level GraphQL executor with automatic retry for transient server errors
 - `extractFeedbackText(submittedFormRender)` — parses scorecard form data to extract feedback text
 - `enrichCandidatesWithDetails(session, candidates, orgInfos, options)` — targeted per-application enrichment pass, called by `extractPipeline()` after the sweep for suspect candidates (time-boxed; sequential in legacy cookie mode)
+- `fetchArchivedForOrg(session, orgId, userId, orgName, options)` — bounded done-sweep of an org's Archived + Hired prebuilt views (recency window + page cap); lean field set, terminal rows only
+- `fetchCandidateRestrictedSummaries(session, candidateId)` — candidate-level "Considered For Jobs" list via `candidate(id).applicationRestrictedSummaries`. **The only query here that can see applications on jobs the seat has no access to** — every prebuilt-view sweep (Active/Archived/Hired) is permission-scoped and silently omits them, and even `candidate(id).applications` filters them out. Returns per-application `{job title, current stage + stageType, archiveReason, enteredStageAt, userHasPermissionToAccess}`. Requires the org's context to already be active. (Field discovered by mining Ashby's frontend JS bundle for the query AST — introspection is disabled and error suggestions are hidden.)
+
+## The Done-Sweep and Pair Semantics (`sweepDoneRowsForOrg` in api-server-extract.ts)
+
+The dashboard downstream treats "archived row, no active row" for a (candidate, org)
+pair as the whole relationship being over. A candidate with a parallel application
+that is still live must therefore never be emitted as done. Two guards in
+`sweepDoneRowsForOrg` enforce that:
+
+1. **Candidate also in the org's active sweep** → their done rows are dropped
+   (the archived application is history; the live one carries the pair's status).
+   Without this, the downstream same-candidate merge lets the done row overwrite
+   the live row's decision status.
+2. **Candidate absent from the active sweep** → probe
+   `fetchCandidateRestrictedSummaries`. A live application there (stageType
+   Active/Offer) replaces the done rows with a synthesized live row:
+   `decision_status="In Process"`, stage/title from the summary, `days_in_stage`
+   from `enteredStageAt`, and `access_restricted=true` when the seat can't open
+   the application (no interview events / feedback / scheduling visibility —
+   the enrichment pass skips these rows). The canonical case: Charles Lin @
+   Reducto — Product Engineer app archived ("Lacks Skills/Qualifications") while
+   his Backend/AI Engineer app sat at Onsite on a job DK's seat can't access;
+   the pair wrongly demoted to Archived on the dashboard.
+   **Probe errors emit nothing for that candidate this fetch** — "couldn't
+   check" must not flip a pair to Archived (confirm-or-skip, same rule the
+   dashboard backend applies to archive-status verification).
+
+Probe cost control (env, set when launching the server):
+```
+ASHBY_RESTRICTED_PROBE_CREDITED_TO   # comma-separated credited-to allowlist for probing;
+                                     # default "david kimball,david,dk"; "*" = probe all
+                                     # done rows; "0"/"off"/"" = disable probing
+ASHBY_RESTRICTED_PROBE_MAX_PER_ORG   # per-org probe cap (default 25); rows past the cap
+                                     # are emitted unprobed (logged)
+```
 
 ## GraphQL Queries Used
 
@@ -100,6 +136,8 @@ The fallback query still includes: candidate info, job/stage data, interview eve
 | `InitialFetch` | `/api/graphql?op=InitialFetch` | Combined: jobs + first app page + session user |
 | `ApiGetActiveApplications` | `/api/graphql?op=ApiGetActiveApplications` | Subsequent application pages (pagination) |
 | `ApiGetSessionUser` | `/api/graphql?op=ApiGetSessionUser` | Verify org switch (used inside `switchOrgContext`) |
+| `ArchivedSweep` | `/api/graphql?op=ArchivedSweep` | Bounded done-sweep pages (Archived/Hired prebuilt views) |
+| `ApiCandidateRestrictedSummaries` | `/api/graphql?op=ApiCandidateRestrictedSummaries` | Candidate-level application list incl. no-access jobs |
 
 ## Build & Run
 

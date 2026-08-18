@@ -1508,6 +1508,75 @@ export async function fetchArchivedForOrg(
   return out;
 }
 
+export interface CandidateRestrictedAppSummary {
+  applicationId: string;
+  jobId: string | null;
+  jobTitle: string | null;
+  stageTitle: string | null;
+  stageType: string | null;
+  enteredStageAt: string | null;
+  lastActivityAt: string | null;
+  archiveReasonText: string | null;
+  hasAccess: boolean;
+}
+
+/**
+ * Candidate-level "Considered For Jobs" list — crucially includes
+ * applications on jobs the session user has NO access to, which never appear
+ * in any prebuilt-view sweep (Active/Archived/Hired are all permission
+ * scoped). This is the same data the Ashby UI uses to render
+ * "Backend/AI Engineer (No access) — Onsite" on a candidate profile.
+ *
+ * The done-sweep uses it to avoid presenting a candidate as archived at an
+ * org where a parallel restricted application is still live (the Charles
+ * Lin @ Reducto case: Product Engineer app archived, Backend/AI Engineer
+ * app at Onsite on a no-access job — the pair is live, not done).
+ *
+ * Caller must already be in the owning org's context.
+ */
+export async function fetchCandidateRestrictedSummaries(
+  session: AshbySession,
+  candidateId: string,
+): Promise<CandidateRestrictedAppSummary[]> {
+  const query = `
+    query ApiCandidateRestrictedSummaries($id: String!) {
+      candidate(id: $id) {
+        id
+        applicationRestrictedSummaries {
+          summary {
+            id
+            job { id title __typename }
+            currentInterviewStage { id title stageType __typename }
+            archiveReason { id text __typename }
+            lastActivityAt
+            currentHistoryEvent { id enteredStageAt __typename }
+            __typename
+          }
+          userHasPermissionToAccess
+          __typename
+        }
+        __typename
+      }
+    }`;
+  const data = await graphqlQuery<{
+    candidate: { applicationRestrictedSummaries: any[] } | null;
+  }>(session, 'ApiCandidateRestrictedSummaries', query, { id: candidateId });
+  const entries = data?.candidate?.applicationRestrictedSummaries || [];
+  return entries
+    .filter((e) => e?.summary?.id)
+    .map((e) => ({
+      applicationId: e.summary.id,
+      jobId: e.summary.job?.id ?? null,
+      jobTitle: e.summary.job?.title ?? null,
+      stageTitle: e.summary.currentInterviewStage?.title ?? null,
+      stageType: e.summary.currentInterviewStage?.stageType ?? null,
+      enteredStageAt: e.summary.currentHistoryEvent?.enteredStageAt ?? null,
+      lastActivityAt: e.summary.lastActivityAt ?? null,
+      archiveReasonText: e.summary.archiveReason?.text ?? null,
+      hasAccess: e.userHasPermissionToAccess !== false,
+    }));
+}
+
 // Candidate identity: pull the LinkedIn profile URL out of Ashby's
 // socialLinks. The dashboard uses it to join a candidate across sources
 // when the display names differ ("Dan Clark" in Slack vs "Daniel Clark"

@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg, fetchCandidateRestrictedSummaries } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -49,6 +49,10 @@ export interface ExtractedCandidate {
   needs_scheduling: boolean;
   credited_to: string;
   source: string;
+  // True when the row was synthesized from a restricted-application summary
+  // (session user can't open the application — stage + title only, no
+  // interview events or feedback are visible).
+  access_restricted?: boolean;
   feedback_count: number;
   latest_recommendation: string;
   latest_feedback_author: string;
@@ -192,6 +196,140 @@ const ENRICH_MIN_BUDGET_MS = parseInt(process.env.ASHBY_ENRICH_MIN_BUDGET_SEC ||
 const INCLUDE_ARCHIVED = !['0', 'false', 'no'].includes((process.env.ASHBY_INCLUDE_ARCHIVED || '1').toLowerCase());
 const ARCHIVED_LOOKBACK_DAYS = parseInt(process.env.ASHBY_ARCHIVED_LOOKBACK_DAYS || '60', 10);
 
+// Restricted-application probe: before a done-sweep row is allowed to present
+// a candidate as archived, check the candidate's "Considered For Jobs" list
+// (which includes no-access jobs) for a parallel application that is still
+// live. Probing costs one GraphQL call per candidate, so it's scoped to rows
+// whose credited-to recruiter matches this comma-separated allowlist.
+// "*" probes every done row; "0"/"off"/"" disables probing entirely.
+const RESTRICTED_PROBE_CREDITED_TO = (process.env.ASHBY_RESTRICTED_PROBE_CREDITED_TO ?? 'david kimball,david,dk').trim().toLowerCase();
+const RESTRICTED_PROBE_MAX_PER_ORG = parseInt(process.env.ASHBY_RESTRICTED_PROBE_MAX_PER_ORG || '25', 10);
+
+function shouldProbeRestricted(creditedTo: string | null): boolean {
+  if (!RESTRICTED_PROBE_CREDITED_TO || ['0', 'off', 'false', 'no'].includes(RESTRICTED_PROBE_CREDITED_TO)) return false;
+  if (RESTRICTED_PROBE_CREDITED_TO === '*') return true;
+  const name = (creditedTo || '').trim().toLowerCase();
+  if (!name) return false;
+  return RESTRICTED_PROBE_CREDITED_TO.split(',').map((s) => s.trim()).filter(Boolean).includes(name);
+}
+
+/**
+ * Bounded done-sweep for one org (Archived + Hired views), with pair
+ * semantics: the dashboard treats "archived row, no active row" for a
+ * (candidate, org) pair as the whole relationship being over, so a candidate
+ * with a parallel application that is still live must never be emitted as
+ * done. Two guards enforce that:
+ *   1. Candidate also in this org's ACTIVE sweep → drop their done rows
+ *      (the archived application is history; the live one is the status).
+ *   2. Candidate absent from the active sweep → probe the candidate-level
+ *      restricted-summaries list, which includes no-access jobs invisible
+ *      to every prebuilt-view sweep. A live application there replaces the
+ *      done rows with a synthesized live row (the Charles Lin @ Reducto
+ *      case). Probe errors drop the candidate's done rows for this fetch
+ *      rather than emitting them — "couldn't check" must not flip a pair
+ *      to Archived (same confirm-or-skip rule the backend applies).
+ *
+ * Returns the rows to add to the extract (never throws).
+ */
+export async function sweepDoneRowsForOrg(
+  session: AshbySession,
+  orgInfo: { id: string; name: string; userId: string },
+  activeCandidates: Candidate[],
+): Promise<Candidate[]> {
+  if (!INCLUDE_ARCHIVED) return [];
+  let done: Candidate[];
+  try {
+    done = await fetchArchivedForOrg(session, orgInfo.id, orgInfo.userId, orgInfo.name, {
+      sinceDays: ARCHIVED_LOOKBACK_DAYS,
+    });
+  } catch (err: any) {
+    console.warn(`  [${orgInfo.name}] archived-sweep failed (non-fatal): ${err?.message?.substring(0, 120)}`);
+    return [];
+  }
+  if (!done.length) return [];
+
+  // Guard 1: an active application at the same org wins over any archived
+  // sibling. (Without this, the same-candidate merge downstream lets the
+  // done row overwrite the live row's decision status.)
+  const activeIds = new Set(activeCandidates.map((c) => c.id));
+  const doneOnly = done.filter((row) => !activeIds.has(row.id));
+  const droppedAsLive = done.length - doneOnly.length;
+  if (droppedAsLive > 0) {
+    console.log(`  [${orgInfo.name}] done-sweep: dropped ${droppedAsLive} row(s) — candidate also in active pipeline`);
+  }
+
+  // Guard 2: restricted-summaries probe, one call per candidate, scoped by
+  // the credited-to allowlist and a per-org cap.
+  const byCandidate = new Map<string, Candidate[]>();
+  for (const row of doneOnly) {
+    if (!byCandidate.has(row.id)) byCandidate.set(row.id, []);
+    byCandidate.get(row.id)!.push(row);
+  }
+
+  const out: Candidate[] = [];
+  let probes = 0;
+  for (const [candidateId, rows] of byCandidate.entries()) {
+    // Hired is a placement — it always stands, live sibling or not.
+    const eligible = rows.some((r) => r.decisionStatus === 'Archived' && shouldProbeRestricted(r.creditedTo));
+    if (!eligible || !candidateId) {
+      out.push(...rows);
+      continue;
+    }
+    if (probes >= RESTRICTED_PROBE_MAX_PER_ORG) {
+      console.warn(`  [${orgInfo.name}] done-sweep: restricted-probe cap (${RESTRICTED_PROBE_MAX_PER_ORG}) hit — emitting remaining done rows unprobed`);
+      out.push(...rows);
+      continue;
+    }
+    probes++;
+    let liveRow: Candidate | null = null;
+    try {
+      const summaries = await fetchCandidateRestrictedSummaries(session, candidateId);
+      const knownDoneApps = new Set(rows.map((r) => r.applicationId));
+      const live = summaries
+        .filter((s) => !knownDoneApps.has(s.applicationId))
+        .filter((s) => s.stageType === 'Active' || s.stageType === 'Offer')
+        .sort((a, b) => (b.enteredStageAt || '').localeCompare(a.enteredStageAt || ''));
+      if (live.length > 0) {
+        const s = live[0];
+        const template = rows[0];
+        const activityAt = s.lastActivityAt || s.enteredStageAt || template.lastActivityAt;
+        liveRow = {
+          ...template,
+          applicationId: s.applicationId,
+          jobId: s.jobId || '',
+          jobTitle: s.jobTitle,
+          pipelineStage: s.stageTitle,
+          stageType: s.stageType,
+          currentStage: 'In Process',
+          decisionStatus: 'In Process',
+          archivedReason: null,
+          archivedReasonType: null,
+          lastActivityAt: activityAt,
+          daysInStage: s.enteredStageAt
+            ? Math.max(0, Math.floor((Date.now() - new Date(s.enteredStageAt).getTime()) / (1000 * 60 * 60 * 24)))
+            : template.daysInStage,
+          needsScheduling: false,
+          accessRestricted: !s.hasAccess,
+          interviewEvents: [],
+          allFeedback: [],
+          latestOverallRecommendation: null,
+          feedbackCount: 0,
+        };
+        console.log(
+          `  [${orgInfo.name}] done-sweep: ${template.name} has a live ${s.hasAccess ? '' : 'no-access '}application (${s.jobTitle ?? '?'} @ ${s.stageTitle ?? '?'}) — emitting live row instead of archived`
+        );
+      }
+    } catch (err: any) {
+      console.warn(
+        `  [${orgInfo.name}] done-sweep: restricted probe failed for ${rows[0]?.name ?? candidateId} — skipping their done row(s) this fetch: ${err?.message?.substring(0, 120)}`
+      );
+      continue; // confirm-or-skip: emit nothing for this candidate
+    }
+    out.push(...(liveRow ? [liveRow] : rows));
+  }
+  return out;
+}
+
 export function getOrgCacheStats() {
   let cachedOrgs = 0;
   let cachedCandidates = 0;
@@ -240,18 +378,15 @@ export async function extractPipeline(
   const failedOrgs: typeof orgsWithUserId = [];
   let authDead = false;
 
-  // Bounded done-sweep for one org (Archived + Hired views). Non-fatal: an
-  // archived-sweep failure must never drop the org's active candidates.
-  const sweepDoneForOrg = async (orgInfo: (typeof orgsWithUserId)[number]) => {
-    if (!INCLUDE_ARCHIVED) return;
-    try {
-      const done = await fetchArchivedForOrg(session, orgInfo.id, orgInfo.userId, orgInfo.name, {
-        sinceDays: ARCHIVED_LOOKBACK_DAYS,
-      });
-      if (done.length) allCandidates.push(...done);
-    } catch (err: any) {
-      console.warn(`  [${orgInfo.name}] archived-sweep failed (non-fatal): ${err?.message?.substring(0, 120)}`);
-    }
+  // Bounded done-sweep for one org — see sweepDoneRowsForOrg for the pair
+  // semantics. Non-fatal: a done-sweep failure must never drop the org's
+  // active candidates.
+  const sweepDoneForOrg = async (
+    orgInfo: (typeof orgsWithUserId)[number],
+    activeCandidates: Candidate[],
+  ) => {
+    const rows = await sweepDoneRowsForOrg(session, orgInfo, activeCandidates);
+    if (rows.length) allCandidates.push(...rows);
   };
 
   // ── Pass 1: fetch all orgs ─────────────────────────────────────────────
@@ -275,7 +410,7 @@ export async function extractPipeline(
       allCandidates.push(...candidates);
       if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
-      await sweepDoneForOrg(orgInfo);
+      await sweepDoneForOrg(orgInfo, candidates);
     } catch (err: any) {
       const msg = err?.message?.substring(0, 150) || '';
       console.error(`  [${orgInfo.name}] Failed: ${msg}`);
@@ -310,7 +445,7 @@ export async function extractPipeline(
         allCandidates.push(...candidates);
         if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
         orgsFetched++;
-        await sweepDoneForOrg(orgInfo);
+        await sweepDoneForOrg(orgInfo, candidates);
         console.log(`  ✓ Retry ${retry} succeeded for ${orgInfo.name}: ${candidates.length} candidates`);
       } catch (err: any) {
         console.error(`  ✗ Retry ${retry} failed for ${orgInfo.name}: ${err?.message?.substring(0, 100)}`);
@@ -358,6 +493,10 @@ export async function extractPipeline(
         // enrich them, or the `stageType && no events` branch below would burn
         // the enrichment budget on every archived candidate.
         if (DONE_STATUS.has(status)) return false;
+        // Restricted-application rows (live app on a no-access job) can't be
+        // opened by this seat at all — the detail query would fail and burn
+        // enrichment budget every refresh.
+        if (c.accessRestricted) return false;
         if (SUSPECT_STATUS.has(status)) return true;
         // Catch records where bulk fetch returned zero events but the
         // candidate looks active — likely missing data.
@@ -486,7 +625,10 @@ export async function extractPipeline(
 
     return {
       company_name: cand.orgName || company?.name || '',
-      job_title: job?.title ?? '',
+      // Fall back to the row-carried title: no-access jobs (restricted-
+      // application rows) are absent from jobsPipelines, so the id lookup
+      // misses for exactly the rows that need a title most.
+      job_title: job?.title ?? cand.jobTitle ?? '',
       job_id: cand.jobId,
       candidate_name: cand.name,
       candidate_id: cand.id,
@@ -508,6 +650,7 @@ export async function extractPipeline(
       needs_scheduling: cand.needsScheduling,
       credited_to: cand.creditedTo ?? '',
       source: cand.source ?? '',
+      access_restricted: cand.accessRestricted ?? false,
       feedback_count: cand.feedbackCount ?? 0,
       latest_recommendation: cand.latestOverallRecommendation ?? '',
       latest_feedback_author: cand.latestFeedbackAuthor ?? '',
