@@ -270,7 +270,9 @@ export async function createCandidateWithDetails(
     await trySet('email', () =>
       graphqlMutation(session, 'ApiUpdateCandidateEmailAddresses', UPDATE_CANDIDATE_EMAILS, {
         id: candidateId,
-        emailAddresses: [{ value: input.email, type: 'Personal', isPrimary: true }],
+        // "personal" lowercase — read off a real record 2026-08-18; the
+        // capitalized variant draws an unhandled server error.
+        emailAddresses: [{ value: input.email, type: 'personal', isPrimary: true }],
       }),
     );
   }
@@ -353,9 +355,66 @@ export async function uploadResumeForCandidate(
   });
 }
 
+const JOB_INTERVIEW_PLAN = `
+query ApiJobInterviewPlan($id: String!) {
+  job(id: $id) {
+    id
+    interviewPlansWithActivities {
+      id
+      isDefault
+      interviewPlan {
+        ... on CustomInterviewPlan { id interviewStages { id title stageType __typename } __typename }
+        ... on InterviewPlanTemplate { id interviewStages { id title stageType __typename } __typename }
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}`;
+
+/**
+ * The job's default interview plan and its entry stage. The manual Add
+ * Candidate flow lands new applications at the Application Review stage, so
+ * prefer the first stage of that type; fall back to the plan's first stage.
+ */
+export async function fetchJobEntryStage(
+  session: AshbySession,
+  jobId: string,
+): Promise<{ interviewPlanId: string; initialInterviewStageId: string; stageTitle: string } | null> {
+  const resp = await graphqlReadQuery<{
+    job: {
+      interviewPlansWithActivities?: Array<{
+        id: string;
+        isDefault: boolean;
+        interviewPlan?: { id: string; interviewStages?: Array<{ id: string; title: string; stageType: string }> };
+      }>;
+    } | null;
+  }>(session, 'ApiJobInterviewPlan', JOB_INTERVIEW_PLAN, { id: jobId });
+  const plans = resp?.job?.interviewPlansWithActivities || [];
+  const plan = plans.find((p) => p.isDefault) || plans[0];
+  const stages = plan?.interviewPlan?.interviewStages || [];
+  if (!plan || stages.length === 0) return null;
+  const entry = stages.find((s) => (s.stageType || '') === 'ApplicationReview')
+    || stages.find((s) => /application review/i.test(s.title || ''))
+    || stages[0];
+  return {
+    interviewPlanId: plan.interviewPlan?.id || plan.id,
+    initialInterviewStageId: entry.id,
+    stageTitle: entry.title,
+  };
+}
+
 export async function createApplicationForCandidate(
   session: AshbySession,
-  input: { candidateId: string; jobId: string; sourceId?: string | null; creditedToUserId?: string | null },
+  input: {
+    candidateId: string;
+    jobId: string;
+    sourceId?: string | null;
+    creditedToUserId?: string | null;
+    interviewPlanId?: string | null;
+    initialInterviewStageId?: string | null;
+  },
 ): Promise<{ applicationId: string }> {
   const resp = await graphqlMutation<{ application: { id: string } }>(
     session,
@@ -364,6 +423,8 @@ export async function createApplicationForCandidate(
     {
       candidateId: input.candidateId,
       jobId: input.jobId,
+      interviewPlanId: input.interviewPlanId ?? null,
+      initialInterviewStageId: input.initialInterviewStageId ?? null,
       sourceId: input.sourceId ?? null,
       creditedToUserId: input.creditedToUserId ?? null,
     },

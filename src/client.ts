@@ -498,6 +498,12 @@ async function graphqlQuery<T>(
       }
 
       console.error(`GraphQL errors for ${operationName}:`, errorMessages);
+      if (retries === 0) {
+        // Mutation path (writes run with retries=0): the message string
+        // alone ("Unidentified server error") is useless for debugging —
+        // dump the full error objects including extensions.
+        console.error(`  full errors for ${operationName}:`, JSON.stringify(response.errors).substring(0, 1000));
+      }
       throw new Error(`GraphQL errors: ${errorMessages}`);
     }
 

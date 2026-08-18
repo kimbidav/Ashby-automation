@@ -34,6 +34,7 @@ import {
   createCandidateWithDetails,
   uploadResumeForCandidate,
   createApplicationForCandidate,
+  fetchJobEntryStage,
   addNoteToCandidate,
 } from './mutations.js';
 import { withGlobalLock } from './write-lock.js';
@@ -654,6 +655,12 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
         return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
       }
       await enterOrgContext(session, org.userId, org.name);
+      // Ashby's org context is PER-USER server state, not per-session: the
+      // operator's own browsing in the Ashby web UI moves the same context
+      // this session writes under. Re-entering (change_user + verify) before
+      // each write step forces the context back and shrinks the race window
+      // from the whole request to milliseconds per mutation group.
+      const reassertOrg = () => enterOrgContext(session, org.userId, org.name);
 
       const warnings: string[] = [];
       const steps: Record<string, string> = { candidate: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
@@ -712,6 +719,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       // Resume — non-fatal.
       if (body.resume?.content_base64 && body.resume?.filename) {
         try {
+          await reassertOrg();
           await uploadResumeForCandidate(session, candidateId, {
             filename: body.resume.filename,
             contentBase64: body.resume.content_base64,
@@ -730,6 +738,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       // job id, including ones this seat can't open).
       let applicationId: string | null = null;
       try {
+        await reassertOrg();
         if (steps.candidate === 'existing') {
           try {
             const summaries = await fetchCandidateRestrictedSummaries(session, candidateId);
@@ -741,11 +750,21 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
           } catch { /* fall through to create */ }
         }
         if (!applicationId) {
+          // The manual flow always supplies the job's interview plan and an
+          // entry stage; omitting them draws an unhandled server error.
+          let plan: { interviewPlanId: string; initialInterviewStageId: string; stageTitle: string } | null = null;
+          try {
+            plan = await fetchJobEntryStage(session, jobId);
+          } catch (err: any) {
+            console.warn(`  add-candidate: entry-stage lookup failed: ${err?.message?.substring(0, 120)}`);
+          }
           const created = await createApplicationForCandidate(session, {
             candidateId,
             jobId,
             sourceId,
             creditedToUserId,
+            interviewPlanId: plan?.interviewPlanId ?? null,
+            initialInterviewStageId: plan?.initialInterviewStageId ?? null,
           });
           applicationId = created.applicationId;
           steps.application = 'created';
@@ -758,6 +777,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       // Note — non-fatal.
       if (typeof body.note_text === 'string' && body.note_text.trim()) {
         try {
+          await reassertOrg();
           await addNoteToCandidate(session, candidateId, body.note_text);
           steps.note = 'created';
         } catch (err: any) {
