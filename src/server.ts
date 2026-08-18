@@ -26,8 +26,17 @@ import crypto from 'crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
-import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats } from './api-server-extract.js';
-import { fetchArchiveStatuses, fetchCsrfToken } from './client.js';
+import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
+import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, enterOrgContext, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
+import {
+  searchCandidatesInOrg,
+  fetchSourceIdByTitle,
+  createCandidateWithDetails,
+  uploadResumeForCandidate,
+  createApplicationForCandidate,
+  addNoteToCandidate,
+} from './mutations.js';
+import { withGlobalLock } from './write-lock.js';
 import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
@@ -36,6 +45,10 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
 
 app.use(cors());
+// The add-candidate route carries a base64 resume PDF (~1.37x file size) —
+// its parser must be registered BEFORE the global 1mb parser so the larger
+// limit wins for that route (body-parser skips an already-parsed body).
+app.use('/api/applications/add-candidate', express.json({ limit: '15mb' }));
 app.use(express.json({ limit: '1mb' }));
 
 // ── Shared-secret auth ─────────────────────────────────────────────────────
@@ -529,8 +542,252 @@ app.post('/api/applications/archive-status', async (req: express.Request, res: e
     return;
   }
   try {
-    const results = await fetchArchiveStatuses(validation.session, applications.slice(0, 50));
+    // Under the global lock: fetchArchiveStatuses switches org contexts and
+    // must not interleave with a sweep or a write.
+    const results = await withGlobalLock('archive-status', () =>
+      fetchArchiveStatuses(validation.session, applications.slice(0, 50)),
+    );
     res.json({ results });
+  } catch (err: any) {
+    handleExtractionError(err, res);
+  }
+});
+
+// ── Add-to-Ashby write endpoints ──────────────────────────────────────────
+//
+// The dashboard's Add-to-Ashby flow. Both routes are under /api/applications
+// (covered by requireSecret on the Railway deploy) and run inside the global
+// lock — org context is server-side session state, so a write must never
+// interleave with a sweep's org switches.
+
+function resolveOrgByName(
+  orgs: Array<{ id: string; name: string; userId: string }>,
+  orgName: string,
+): { id: string; name: string; userId: string } | null {
+  const wanted = (orgName || '').trim().toLowerCase();
+  if (!wanted) return null;
+  const compact = wanted.replace(/\s+/g, '');
+  return (
+    orgs.find((o) => o.name.trim().toLowerCase() === wanted) ||
+    orgs.find((o) => o.name.trim().toLowerCase().replace(/\s+/g, '') === compact) ||
+    null
+  );
+}
+
+const CANDIDATE_LABS_SOURCE_TITLE = process.env.ASHBY_SOURCE_TITLE || 'Sourced: Candidate Labs';
+
+app.post('/api/applications/open-jobs', async (req: express.Request, res: express.Response) => {
+  const validation = await validateCookie(req.body?.cookie);
+  if ('error' in validation) {
+    res.status(validation.status).json({ error: validation.error });
+    return;
+  }
+  const orgName = typeof req.body?.org_name === 'string' ? req.body.org_name : '';
+  try {
+    const payload = await withGlobalLock('open-jobs', async () => {
+      const orgs = (await fetchAllAvailableOrgs(validation.session)).filter((o) => o.userId);
+      const org = resolveOrgByName(orgs, orgName);
+      if (!org) {
+        return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
+      }
+      await enterOrgContext(validation.session, org.userId, org.name);
+      const jobs = await fetchOpenJobsForOrg(validation.session);
+      let sourceId: string | null = null;
+      let sourceTitle: string | null = null;
+      try {
+        const source = await fetchSourceIdByTitle(validation.session, CANDIDATE_LABS_SOURCE_TITLE);
+        sourceId = source?.id ?? null;
+        sourceTitle = source?.displayTitle ?? null;
+      } catch (err: any) {
+        console.warn(`  open-jobs: source lookup failed (non-fatal): ${err?.message?.substring(0, 120)}`);
+      }
+      return {
+        org_name: org.name,
+        jobs: jobs.map((j) => ({ id: j.id, title: j.title, location: j.locationName, application_count: j.applicationCount })),
+        source_id: sourceId,
+        source_title: sourceTitle,
+        // available_identities returns the session user's identity per org,
+        // so this userId IS the credited-to user id for that org.
+        credited_to_user_id: org.userId,
+      };
+    });
+    if ((payload as any).__status) {
+      const { __status, ...body } = payload as any;
+      res.status(__status).json(body);
+      return;
+    }
+    res.json(payload);
+  } catch (err: any) {
+    handleExtractionError(err, res);
+  }
+});
+
+// Body: { org_name, job_id, candidate: {name, email?, linkedin_url?},
+//         resume: {filename, content_base64}|null, note_text?,
+//         source_id?, credited_to_user_id?,
+//         existing_candidate_id?, skip_duplicate_check? }
+// Partial-failure contract: once the candidate exists, downstream failures
+// come back as HTTP 200 with a per-step status map; the caller retries by
+// resending with existing_candidate_id.
+app.post('/api/applications/add-candidate', async (req: express.Request, res: express.Response) => {
+  const validation = await validateCookie(req.body?.cookie);
+  if ('error' in validation) {
+    res.status(validation.status).json({ error: validation.error });
+    return;
+  }
+  const body = req.body || {};
+  const orgName = typeof body.org_name === 'string' ? body.org_name : '';
+  const jobId = typeof body.job_id === 'string' ? body.job_id : '';
+  const cand = body.candidate || {};
+  const candName = typeof cand.name === 'string' ? cand.name.trim() : '';
+  if (!orgName || !jobId || !candName) {
+    res.status(400).json({ error: 'missing_fields', detail: 'org_name, job_id, and candidate.name are required' });
+    return;
+  }
+
+  try {
+    const payload = await withGlobalLock('add-candidate', async () => {
+      const session = validation.session;
+      const orgs = (await fetchAllAvailableOrgs(session)).filter((o) => o.userId);
+      const org = resolveOrgByName(orgs, orgName);
+      if (!org) {
+        return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
+      }
+      await enterOrgContext(session, org.userId, org.name);
+
+      const warnings: string[] = [];
+      const steps: Record<string, string> = { candidate: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
+      const normLi = (u: string) =>
+        (u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('?')[0].replace(/\/+$/, '');
+
+      let candidateId: string = typeof body.existing_candidate_id === 'string' ? body.existing_candidate_id : '';
+
+      // Duplicate pre-check — BEFORE any write. LinkedIn slug match first,
+      // exact normalized name second.
+      if (!candidateId && body.skip_duplicate_check !== true) {
+        const hits = await searchCandidatesInOrg(session, candName);
+        const liWanted = cand.linkedin_url ? normLi(cand.linkedin_url) : '';
+        const matches = hits.filter((h) => {
+          if (liWanted && h.linkedinUrl && normLi(h.linkedinUrl) === liWanted) return true;
+          return h.name.trim().toLowerCase() === candName.toLowerCase();
+        });
+        if (matches.length > 0) {
+          return {
+            __status: 409,
+            error: 'candidate_exists',
+            matches: matches.map((m) => ({ id: m.id, name: m.name, email: m.email, linkedin_url: m.linkedinUrl })),
+          };
+        }
+      }
+
+      // Attribution ids — either passed through from the open-jobs prefill
+      // or resolved here. Soft-fail: an upload without attribution beats no
+      // upload; the warning is surfaced in the modal.
+      let sourceId: string | null = typeof body.source_id === 'string' ? body.source_id : null;
+      if (!sourceId) {
+        try {
+          sourceId = (await fetchSourceIdByTitle(session, CANDIDATE_LABS_SOURCE_TITLE))?.id ?? null;
+        } catch { /* soft-fail below */ }
+        if (!sourceId) warnings.push(`source "${CANDIDATE_LABS_SOURCE_TITLE}" not found in this org — attribution skipped`);
+      }
+      const creditedToUserId: string | null =
+        typeof body.credited_to_user_id === 'string' ? body.credited_to_user_id : org.userId;
+
+      // Create (point of no return) — or reuse the retry path's id.
+      if (candidateId) {
+        steps.candidate = 'existing';
+      } else {
+        const created = await createCandidateWithDetails(session, {
+          name: candName,
+          email: typeof cand.email === 'string' && cand.email.trim() ? cand.email.trim() : null,
+          linkedinUrl: typeof cand.linkedin_url === 'string' && cand.linkedin_url.trim() ? cand.linkedin_url.trim() : null,
+          sourceId,
+          creditedToUserId,
+        });
+        candidateId = created.candidateId;
+        warnings.push(...created.warnings);
+        steps.candidate = 'created';
+      }
+
+      // Resume — non-fatal.
+      if (body.resume?.content_base64 && body.resume?.filename) {
+        try {
+          await uploadResumeForCandidate(session, candidateId, {
+            filename: body.resume.filename,
+            contentBase64: body.resume.content_base64,
+          });
+          steps.resume = 'uploaded';
+        } catch (err: any) {
+          steps.resume = 'failed';
+          warnings.push(`resume upload failed: ${err?.message?.substring(0, 150)}`);
+        }
+      } else {
+        steps.resume = 'skipped';
+      }
+
+      // Application — on the retry path, re-check for one on this job first
+      // (the restricted-summaries lookup returns every application with its
+      // job id, including ones this seat can't open).
+      let applicationId: string | null = null;
+      try {
+        if (steps.candidate === 'existing') {
+          try {
+            const summaries = await fetchCandidateRestrictedSummaries(session, candidateId);
+            const existing = summaries.find((s) => s.jobId === jobId);
+            if (existing) {
+              applicationId = existing.applicationId;
+              steps.application = 'existing';
+            }
+          } catch { /* fall through to create */ }
+        }
+        if (!applicationId) {
+          const created = await createApplicationForCandidate(session, {
+            candidateId,
+            jobId,
+            sourceId,
+            creditedToUserId,
+          });
+          applicationId = created.applicationId;
+          steps.application = 'created';
+        }
+      } catch (err: any) {
+        steps.application = 'failed';
+        warnings.push(`application create failed: ${err?.message?.substring(0, 150)}`);
+      }
+
+      // Note — non-fatal.
+      if (typeof body.note_text === 'string' && body.note_text.trim()) {
+        try {
+          await addNoteToCandidate(session, candidateId, body.note_text);
+          steps.note = 'created';
+        } catch (err: any) {
+          steps.note = 'failed';
+          warnings.push(`note create failed: ${err?.message?.substring(0, 150)}`);
+        }
+      } else {
+        steps.note = 'skipped';
+      }
+
+      // A write changes org state — cached sweep results are now stale.
+      resultCache = null;
+      clearOrgCache();
+
+      return {
+        success: steps.application === 'created' || steps.application === 'existing',
+        candidate_id: candidateId,
+        application_id: applicationId,
+        candidate_url: `https://app.ashbyhq.com/candidates/${candidateId}`,
+        org_name: org.name,
+        steps,
+        warnings,
+      };
+    });
+    if ((payload as any).__status) {
+      const { __status, ...bodyOut } = payload as any;
+      res.status(__status).json(bodyOut);
+      return;
+    }
+    res.json(payload);
   } catch (err: any) {
     handleExtractionError(err, res);
   }
@@ -619,7 +876,7 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
   }
 
   try {
-    const data = await extractPipeline(validation.session);
+    const data = await withGlobalLock('extract', () => extractPipeline(validation.session));
     const result = formatResult(data);
     setCachedResult(result);
     res.json(result);
@@ -682,10 +939,13 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
   jobs.set(jobId, job);
   runningJobId = jobId;
 
-  // Fire and forget — extraction runs in the background
-  extractPipeline(validation.session, (completed, total, currentOrg) => {
-    job.progress = { completed, total, current_org: currentOrg };
-  })
+  // Fire and forget — extraction runs in the background (under the global
+  // lock so it can't interleave org switches with a write).
+  withGlobalLock('extract-async', () =>
+    extractPipeline(validation.session, (completed, total, currentOrg) => {
+      job.progress = { completed, total, current_org: currentOrg };
+    }),
+  )
     .then((data) => {
       const result = formatResult(data);
       setCachedResult(result);

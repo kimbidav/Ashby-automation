@@ -507,6 +507,108 @@ async function graphqlQuery<T>(
   throw new Error('Unreachable code in graphqlQuery');
 }
 
+/**
+ * Mutation-safe GraphQL executor. Identical transport to graphqlQuery but
+ * with retries pinned to 0: the read path's auto-retry on transient errors
+ * would double-execute a write (duplicate candidate, duplicate note). CSRF
+ * self-heal on 403 is retained inside graphqlQuery's first attempt only.
+ */
+export async function graphqlMutation<T>(
+  session: AshbySession,
+  operationName: string,
+  query: string,
+  variables: Record<string, unknown> = {},
+): Promise<T> {
+  return graphqlQuery<T>(session, operationName, query, variables, false, 0);
+}
+
+/**
+ * Read-query executor for modules outside this file (mutations.ts's dup
+ * pre-check and source lookup). Same transport and retry semantics as the
+ * internal read path.
+ */
+export async function graphqlReadQuery<T>(
+  session: AshbySession,
+  operationName: string,
+  query: string,
+  variables: Record<string, unknown> = {},
+): Promise<T> {
+  return graphqlQuery<T>(session, operationName, query, variables);
+}
+
+/**
+ * Switch into an org's context and VERIFY the switch landed where intended.
+ * Every write path must go through this: org context is server-side state on
+ * Ashby's end, and a mis-switch (or a race with another request) would land
+ * candidate data in the wrong client's ATS. Throws `wrong_org_context`
+ * when the post-switch session reports a different org.
+ */
+export async function enterOrgContext(
+  session: AshbySession,
+  userId: string,
+  expectedOrgName: string,
+): Promise<{ orgId: string; orgName: string }> {
+  await switchOrgContext(session, userId); // refreshes CSRF eagerly inside
+  const verifyQuery = `
+    query ApiGetSessionUser {
+      user: sessionUserV2 {
+        id
+        organizationId
+        organizationName
+        __typename
+      }
+    }`;
+  const resp = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
+    session,
+    'ApiGetSessionUser',
+    verifyQuery,
+  );
+  const actual = (resp?.user?.organizationName || '').trim();
+  if (actual.toLowerCase() !== expectedOrgName.trim().toLowerCase()) {
+    throw new Error(
+      `wrong_org_context: expected "${expectedOrgName}" but session is in "${actual || 'unknown'}" — aborting before any write`,
+    );
+  }
+  return { orgId: resp.user.organizationId, orgName: actual };
+}
+
+/**
+ * Live open-jobs list for the CURRENT org context (call enterOrgContext
+ * first). Trimmed from the InitialFetch document — no application sweep,
+ * fresh every call. Powers the Add-to-Ashby modal's job picker.
+ */
+export async function fetchOpenJobsForOrg(
+  session: AshbySession,
+): Promise<Array<{ id: string; title: string; locationName: string | null; applicationCount: number }>> {
+  const query = `
+    query ApiOpenJobs {
+      jobsPipelines(onlyIncludeOpenJobs: true, onlyIncludeJobsUserFollowsOrHasRole: false) {
+        jobId
+        jobTitle
+        jobLocationName
+        applicationCount
+        __typename
+      }
+    }`;
+  // Ashby's first jobsPipelines hit after an org switch can exceed the 15s
+  // transport timeout (same transient the sweep retries whole orgs for).
+  // This is a read — one retry on abort is safe and keeps the modal usable.
+  let resp: { jobsPipelines: Array<{ jobId: string; jobTitle: string; jobLocationName: string | null; applicationCount: number }> };
+  try {
+    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+  } catch (err: any) {
+    if (err?.type !== 'aborted' && !/abort/i.test(err?.message || '')) throw err;
+    console.warn('  open-jobs: request timed out, retrying once...');
+    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+  }
+  return (resp?.jobsPipelines || []).map((j) => ({
+    id: j.jobId,
+    title: j.jobTitle,
+    locationName: j.jobLocationName ?? null,
+    applicationCount: j.applicationCount ?? 0,
+  }));
+}
+
 export interface OrgInfo {
   id: string;
   name: string;
