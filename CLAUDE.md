@@ -152,7 +152,8 @@ Shapes that MUST be respected (each one cost a debugging session):
   `attachments`/`metadata` blocks — plain text nodes draw the server error.
 - Source titles vary per org ("Sourced: Candidate Labs" / "Agencies: Candidate Labs" /
   "Agency - Candidate Labs") and `searchSourceByTitle` matches by PREFIX — search
-  several prefixes and pick the title containing "candidate labs".
+  several prefixes and pick the title containing "candidate labs". The preferred exact
+  title is overridable via `ASHBY_SOURCE_TITLE` (default "Sourced: Candidate Labs").
 - Resume upload is presigned-POST (`createFileUploadHandle` → multipart to the storage
   URL: Content-Type first, `fields` entries, `file` last →
   `uploadCandidateResume(resumeHandle, candidateId)`).
