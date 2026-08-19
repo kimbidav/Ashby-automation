@@ -835,6 +835,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
         application_id: applicationId,
         candidate_url: `https://app.ashbyhq.com/candidates/${candidateId}`,
         org_name: org.name,
+        org_id: org.id,
         steps,
         warnings,
       };

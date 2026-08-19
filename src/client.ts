@@ -1518,7 +1518,7 @@ export async function fetchArchivedForOrg(
         __typename`;
 
   const out: Candidate[] = [];
-  for (const view of ['Archived', 'Hired'] as const) {
+  for (const view of ['Archived', 'Hired', 'ApplicationReview'] as const) {
     const query = `
       query ArchivedSweep($cursor: String, $limit: Int, $orderByFields: [OrderByFieldInput]) {
         result: applicationsByPrebuiltView(
@@ -1554,6 +1554,7 @@ export async function fetchArchivedForOrg(
         }
         const reasonText: string | null = app?.archiveReason?.text ?? null;
         const reasonType: string | null = app?.archiveReason?.reasonType ?? null;
+        const isPreInterview = view === 'ApplicationReview';
         const looksHired = view === 'Hired'
           || /hire/i.test(reasonType || '')
           || /hire/i.test(reasonText || '');
@@ -1575,7 +1576,7 @@ export async function fetchArchivedForOrg(
           // Keep a non-null stageType so the dashboard treats this as a real
           // Ashby record (stage_type="" marks Slack-only placeholders). Falls
           // back to "Archived"/"Hired" when Ashby drops currentInterviewStage.
-          stageType: app?.currentInterviewStage?.stageType || (looksHired ? 'Hired' : 'Archived'),
+          stageType: app?.currentInterviewStage?.stageType || (isPreInterview ? 'PreInterviewScreen' : (looksHired ? 'Hired' : 'Archived')),
           currentStageIndex: null,
           totalStages: null,
           stageProgress: null,
@@ -1588,11 +1589,11 @@ export async function fetchArchivedForOrg(
           needsScheduling: false,
           creditedTo,
           source: app?.source?.title || null,
-          decisionStatus: looksHired ? 'Hired' : 'Archived',
+          decisionStatus: isPreInterview ? (app?.applicationStatus?.description || 'In Process') : (looksHired ? 'Hired' : 'Archived'),
           statusPriority: app?.applicationStatus?.priority ?? null,
           statusDueAt: app?.applicationStatus?.dueAt ?? null,
-          archivedReason: reasonText,
-          archivedReasonType: reasonType,
+          archivedReason: isPreInterview ? null : reasonText,
+          archivedReasonType: isPreInterview ? null : reasonType,
           primaryEmailAddress: null,
           phoneNumber: null,
           location: null,
