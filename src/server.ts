@@ -38,7 +38,7 @@ import {
   fetchJobEntryStage,
   addNoteToCandidate,
 } from './mutations.js';
-import { withGlobalLock } from './write-lock.js';
+import { withGlobalLock, lockHolder } from './write-lock.js';
 import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
@@ -585,6 +585,19 @@ app.post('/api/applications/open-jobs', async (req: express.Request, res: expres
     return;
   }
   const orgName = typeof req.body?.org_name === 'string' ? req.body.org_name : '';
+  // Fast-fail when a sweep (or another write) holds the global lock —
+  // queueing a modal request behind a 15-minute extraction reads as a hang.
+  {
+    const holder = lockHolder();
+    if (holder) {
+      res.status(503).json({
+        error: 'extractor_busy',
+        holder,
+        instructions: 'An Ashby refresh sweep is running. Try again when it finishes (usually a few minutes).',
+      });
+      return;
+    }
+  }
   try {
     const payload = await withGlobalLock('open-jobs', async () => {
       const orgs = (await fetchAllAvailableOrgs(validation.session)).filter((o) => o.userId);
@@ -647,6 +660,19 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
     return;
   }
 
+  // Fast-fail when a sweep (or another write) holds the global lock —
+  // queueing a modal request behind a 15-minute extraction reads as a hang.
+  {
+    const holder = lockHolder();
+    if (holder) {
+      res.status(503).json({
+        error: 'extractor_busy',
+        holder,
+        instructions: 'An Ashby refresh sweep is running. Try again when it finishes (usually a few minutes).',
+      });
+      return;
+    }
+  }
   try {
     const payload = await withGlobalLock('add-candidate', async () => {
       const session = validation.session;
