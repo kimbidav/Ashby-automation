@@ -188,13 +188,16 @@ const PROFILE_DIR = path.resolve(
   process.env.PLAYWRIGHT_PROFILE_DIR || '.playwright-browser-data',
 );
 
-async function probeLiveAuth(ctx: BrowserContext): Promise<{ ok: boolean; reason?: string; csrfToken?: string }> {
+async function probeLiveAuth(
+  ctx: BrowserContext,
+  timeoutMs = 8000,
+): Promise<{ ok: boolean; reason?: string; csrfToken?: string; unreachable?: boolean }> {
   // Cheap endpoint that requires an authenticated session — the CSRF token
   // endpoint returns 200 + a token when the cookie jar is valid, 401 when not.
   try {
     const res = await ctx.request.fetch('https://app.ashbyhq.com/api/csrf/token', {
       method: 'GET',
-      timeout: 8000,
+      timeout: timeoutMs,
       failOnStatusCode: false,
     });
     if (res.ok()) {
@@ -203,7 +206,10 @@ async function probeLiveAuth(ctx: BrowserContext): Promise<{ ok: boolean; reason
     }
     return { ok: false, reason: `auth probe returned ${res.status()}` };
   } catch (err: any) {
-    return { ok: false, reason: err?.message || 'probe error' };
+    // No HTTP answer at all (timeout, network): Ashby is slow or unreachable.
+    // That says nothing about whether the login is valid. Redacted: Playwright
+    // appends the request headers, cookie included.
+    return { ok: false, unreachable: true, reason: redactSecrets(err?.message || 'probe error') };
   }
 }
 
@@ -284,13 +290,29 @@ async function validateCookie(cookie: unknown): Promise<{ session: AshbySession 
   // persistence hook — the live cookie map is empty by design and the
   // Playwright profile owns those cookies.
   if (liveContext) {
-    const probe = await probeLiveAuth(liveContext);
+    let probe = await probeLiveAuth(liveContext);
+    if (!probe.ok && probe.unreachable) {
+      console.warn(`[live-auth] probe got no answer (${probe.reason}); retrying once with a longer timeout`);
+      probe = await probeLiveAuth(liveContext, 20000);
+    }
     if (probe.ok) {
       return { session: liveSessionFromContext(liveContext, probe.csrfToken) };
     }
     console.warn(`[live-auth] liveContext present but probe failed: ${probe.reason}`);
-    // Don't bail with 401 yet — STORED_COOKIE / persistent-file paths
-    // may still authenticate via the legacy transport.
+    if (probe.unreachable) {
+      // Do NOT fall back to the persisted session here. It is a DIFFERENT,
+      // usually older login whose org list was fixed when it was created, so
+      // a slow moment at Ashby would silently swap the caller onto a session
+      // that can't see recently added clients (the Prelim case, 2026-09-18:
+      // the same request alternated between "3 open jobs" and `unknown_org`).
+      // Say Ashby is slow and let the caller retry on the login DK chose.
+      return {
+        error: 'ashby_slow: Ashby did not answer the live-session check. Nothing was read or written; try again in a moment.',
+        status: 503,
+      };
+    }
+    // The live login answered and was REJECTED (e.g. 401): the persisted
+    // file / STORED_COOKIE may still authenticate via the legacy transport.
   }
 
   // 3. Persisted session file / Playwright profile. This is the shared-team
