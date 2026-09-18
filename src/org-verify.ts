@@ -144,6 +144,21 @@ export function wrongOrgResponseBody(err: WrongOrgContextError): Record<string, 
 }
 
 /**
+ * Make an error message safe to log or return to a caller. Playwright's
+ * request errors append a "Call log" with every request header, which includes
+ * the Ashby session cookie and CSRF token; nothing past that marker is needed
+ * to diagnose a failure. Cookie/CSRF-looking fragments are masked as well.
+ */
+export function redactSecrets(message: string): string {
+  let m = message || '';
+  const cut = m.indexOf('Call log:');
+  if (cut !== -1) m = m.slice(0, cut).trimEnd();
+  return m
+    .replace(/(ashby_session_token|x-csrf-token|cookie|authorization)\s*[:=]\s*[^\s;,]+/gi, '$1=[redacted]')
+    .replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+/**
  * True when an error message means the Ashby login is dead. `\b401\b` rather
  * than a bare substring: ids and counts in unrelated messages contain "401".
  */

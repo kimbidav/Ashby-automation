@@ -28,7 +28,7 @@ import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
 import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, enterOrgContext, verifyCurrentOrgHasJob, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
-import { isWrongOrgContextError, wrongOrgResponseBody, isSessionAuthFailure } from './org-verify.js';
+import { isWrongOrgContextError, wrongOrgResponseBody, isSessionAuthFailure, redactSecrets } from './org-verify.js';
 import {
   searchCandidatesInOrg,
   fetchSourceIdByTitle,
@@ -512,7 +512,8 @@ function formatResult(data: ExtractResult & { extraction_stats?: Record<string, 
 }
 
 function handleExtractionError(err: any, res: express.Response) {
-  const message = err?.message || String(err);
+  // Redacted first: this string is logged AND returned to the caller.
+  const message = redactSecrets(err?.message || String(err));
 
   // Wrong-org aborts first, and as 409: the coordinator backend passes 409
   // through verbatim, so the UI can say "nothing was written" (or name the

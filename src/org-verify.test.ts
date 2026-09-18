@@ -10,6 +10,7 @@ import {
   describeKeys,
   isSessionAuthFailure,
   isWrongOrgContextError,
+  redactSecrets,
   verdictFromSwitchBody,
   verifyJobMembership,
   wrongOrgResponseBody,
@@ -132,4 +133,12 @@ test('an unrecognised change_user shape is unknown, never a pass or a fail', () 
   for (const body of [null, '', {}, { user: null }, { user: { email: 'x' } }, { ok: true }]) {
     assert.equal(verdictFromSwitchBody(body, { userId: 'u', orgId: 'o' }), 'unknown');
   }
+});
+
+test('request errors never carry the session cookie or CSRF token', () => {
+  const raw = 'apiRequestContext.fetch: Timeout 15000ms exceeded.\nCall log:\n  - x-csrf-token: SECRETCSRF\n  - cookie: authenticated=true; ashby_session_token=s%3ASECRETSESSION';
+  const safe = redactSecrets(raw);
+  assert.equal(safe, 'apiRequestContext.fetch: Timeout 15000ms exceeded.');
+  assert.equal(redactSecrets('failed with ashby_session_token=s%3ASECRETSESSION; x'), 'failed with ashby_session_token=[redacted]; x');
+  for (const out of [safe, redactSecrets('x-csrf-token: SECRETCSRF')]) assert.ok(!/SECRET/.test(out));
 });
