@@ -609,6 +609,19 @@ function resolveOrgByName(
   );
 }
 
+/**
+ * Link to a freshly uploaded candidate. Format read off a working page
+ * 2026-09-18: the application's panel inside the Application Review pipeline
+ * view, which is where every upload lands for an external-recruiter seat.
+ * The bare `/candidates/<id>` this used to return 404s for that seat. With no
+ * application there is no view that shows the candidate, so return null and
+ * let the caller hide the link instead of offering a dead one.
+ */
+function ashbyCandidateUrl(candidateId: string, applicationId: string | null): string | null {
+  if (!candidateId || !applicationId) return null;
+  return `https://app.ashbyhq.com/candidates/pipeline/application-review/right-side/candidates/${candidateId}/applications/${applicationId}/feed`;
+}
+
 const CANDIDATE_LABS_SOURCE_TITLE = process.env.ASHBY_SOURCE_TITLE || 'Sourced: Candidate Labs';
 
 app.post('/api/applications/open-jobs', async (req: express.Request, res: express.Response) => {
@@ -884,7 +897,7 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
         success: steps.application === 'created' || steps.application === 'existing',
         candidate_id: candidateId,
         application_id: applicationId,
-        candidate_url: `https://app.ashbyhq.com/candidates/${candidateId}`,
+        candidate_url: ashbyCandidateUrl(candidateId, applicationId),
         org_name: org.name,
         org_id: org.id,
         steps,
