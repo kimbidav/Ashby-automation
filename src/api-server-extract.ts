@@ -403,7 +403,8 @@ export async function extractPipeline(
       const { companies, jobs, candidates } = await fetchPipelineForOrg(
         session,
         orgInfo.id,
-        orgInfo.userId
+        orgInfo.userId,
+        orgInfo.name
       );
       allCompanies.push(...companies);
       allJobs.push(...jobs);
@@ -438,7 +439,8 @@ export async function extractPipeline(
         const { companies, jobs, candidates } = await fetchPipelineForOrg(
           session,
           orgInfo.id,
-          orgInfo.userId
+          orgInfo.userId,
+          orgInfo.name
         );
         allCompanies.push(...companies);
         allJobs.push(...jobs);
@@ -532,7 +534,7 @@ export async function extractPipeline(
   if (firstOrg?.userId) {
     try {
       onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Restoring context to ${firstOrg.name}...`);
-      await fetchPipelineForOrg(session, firstOrg.id, firstOrg.userId);
+      await fetchPipelineForOrg(session, firstOrg.id, firstOrg.userId, firstOrg.name);
       console.log(`✓ Restored org context to ${firstOrg.name}`);
     } catch (err: any) {
       console.warn(`⚠️  Could not restore org context: ${err?.message?.substring(0, 100)}`);

@@ -165,6 +165,39 @@ and `src/write-lock.ts` serializes ALL session use (extract, archive-status, wri
 org context is server-side per session, so a write racing a sweep's `change_user` calls
 would land data in the wrong client's ATS.
 
+**How the org is verified (`src/org-verify.ts`, rebuilt 2026-09-18).** The check used to
+read `sessionUserV2.organizationName`. Ashby removed that field on 2026-08-26, which
+500'd `open-jobs` and every upload. The internal API is feature-frozen (see the public-API
+migration), so the replacement adds **no new operation**: after the switch, the target
+`job_id` must be in `fetchOpenJobsForOrg` (`ApiOpenJobs`, already used by the job picker).
+Job ids are org-unique, so membership proves the session is in the org that owns the job.
+- **Fail closed.** Job missing → `job_not_in_org` (wrong org, *or* the job closed since it
+  was picked); list unfetchable → `verification_unavailable`. Never a pass.
+- **Where it runs in add-candidate:** on entry; again immediately before `ApiAddCandidate`
+  (the duplicate check in between takes seconds); then `verifyCurrentOrgHasJob` — WITHOUT
+  switching — from `createCandidateWithDetails`'s `afterDraft` hook, the moment the blank
+  draft exists. `addCandidate` takes no arguments, so it is the one write that lands
+  wherever the session is; every later mutation is keyed by candidate/job id. A
+  post-create failure (`post_create_mismatch`) throws before any field is set or the draft
+  is published, so the worst a race leaves is a blank, invisible draft, never a named
+  candidate in the wrong ATS. `reassertOrg` (switch + verify) still precedes the resume,
+  application and note groups.
+- **Two layers.** (1) *Identity*, reads and writes: the body of the `change_user` call this
+  repo already makes names the identity it landed in (`user.id`, `user.organizationId`;
+  shape confirmed live 2026-09-18). A mismatch aborts (`identity_mismatch`); an unrecognised
+  shape is `unknown` and proves nothing either way. (2) *Job membership*, writes only:
+  catches what identity can't, DK's browser moving the context after the switch.
+  `open-jobs` reports what it proved in `org_verification` (`identity` | `none`). The
+  coordinator also cross-checks returned job ids against its snapshot.
+- **Errors are 409**, not 500: `handleExtractionError` checks `isWrongOrgContextError`
+  first and returns `{error:'wrong_org_context', reason, nothing_written,
+  draft_candidate_id?, detail, instructions}`; the coordinator passes 409 through
+  verbatim. Messages carry no ids, and session-death detection is `/\b401\b/` rather
+  than a substring, because a UUID can contain "401".
+- `switchOrgContext` and `fetchAllAvailableOrgs` log the **key names** (never values) of
+  their responses once per process, so a future Ashby shape change is visible in the log.
+- Unit tests: `npm test` (`src/org-verify.test.ts`, node:test).
+
 Endpoints (`/api/applications/*`, behind `requireSecret` on Railway):
 - `POST /api/applications/open-jobs` `{org_name}` → open jobs + "Sourced: Candidate
   Labs" source id + per-org credited-to user id (the org's own `userId` from
@@ -176,8 +209,11 @@ Endpoints (`/api/applications/*`, behind `requireSecret` on Railway):
   its own 15mb JSON limit for the base64 resume.
 
 `src/write-discovery.ts` is the read-only validation harness (org guard, open jobs,
-source resolution, candidate search, social-link enum) — run it after Ashby ships
-frontend changes if writes start failing.
+source resolution, candidate search, social-link enum; `--foreign-job <id>` asserts that
+another org's job id aborts) — run it after Ashby ships frontend changes if writes start
+failing. **It is a separate process that switches org context OUTSIDE the server's lock,
+and the sweep no longer verifies which org it is in. Never run it during a refresh:** the
+sweep would file that org's remaining pages under the wrong client.
 
 ## GraphQL Queries Used
 
@@ -185,7 +221,8 @@ frontend changes if writes start failing.
 |---------------|----------|---------|
 | `InitialFetch` | `/api/graphql?op=InitialFetch` | Combined: jobs + first app page + session user |
 | `ApiGetActiveApplications` | `/api/graphql?op=ApiGetActiveApplications` | Subsequent application pages (pagination) |
-| `ApiGetSessionUser` | `/api/graphql?op=ApiGetSessionUser` | Verify org switch (used inside `switchOrgContext`) |
+| ~~`ApiGetSessionUser`~~ | — | REMOVED 2026-09-18: queried `sessionUserV2`, which Ashby deleted 2026-08-26. Org verification now uses `ApiOpenJobs` (see Write Support). |
+| `ApiOpenJobs` | `/api/graphql?op=ApiOpenJobs` | Open jobs for the current org: the job picker AND the proof-of-org check before writes |
 | `ArchivedSweep` | `/api/graphql?op=ArchivedSweep` | Bounded done-sweep pages (Archived/Hired prebuilt views) |
 | `ApiCandidateRestrictedSummaries` | `/api/graphql?op=ApiCandidateRestrictedSummaries` | Candidate-level application list incl. no-access jobs |
 

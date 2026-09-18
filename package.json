@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node --loader ts-node/esm src/cli.ts",
     "server": "ASHBY_EXTRACT_BUDGET_SEC=\"${ASHBY_EXTRACT_BUDGET_SEC:-720}\" node --loader ts-node/esm src/server.ts",
-    "server:prod": "ASHBY_EXTRACT_BUDGET_SEC=\"${ASHBY_EXTRACT_BUDGET_SEC:-720}\" node dist/server.js"
+    "server:prod": "ASHBY_EXTRACT_BUDGET_SEC=\"${ASHBY_EXTRACT_BUDGET_SEC:-720}\" node dist/server.js",
+    "test": "TS_NODE_TRANSPILE_ONLY=1 node --loader ts-node/esm src/org-verify.test.ts"
   },
   "keywords": [
     "ashby",
