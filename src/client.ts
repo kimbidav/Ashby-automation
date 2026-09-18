@@ -23,6 +23,7 @@
 import fetch from 'cross-fetch';
 import type { APIResponse } from 'playwright';
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
+import { verifyJobMembership, logShapeOnce, verdictFromSwitchBody, WrongOrgContextError, IdentityVerdict } from './org-verify.js';
 
 export interface RawPipelineRow {
   // Shape will be filled in once endpoints are known.
@@ -542,40 +543,63 @@ export async function graphqlReadQuery<T>(
   return graphqlQuery<T>(session, operationName, query, variables);
 }
 
+export interface OrgVerifyOptions {
+  /**
+   * The job the caller is about to write against. When set, the switch is
+   * VERIFIED: the job must be in the org's open-jobs list afterwards. Every
+   * write path passes it. Omit only for reads, where nothing can be verified
+   * and nothing is written.
+   */
+  jobId?: string;
+  /** False once a draft candidate exists (shapes the error the caller sees). */
+  nothingWritten?: boolean;
+  /** The org's id, so the `change_user` response can be checked against it. */
+  orgId?: string;
+}
+
 /**
- * Switch into an org's context and VERIFY the switch landed where intended.
- * Every write path must go through this: org context is server-side state on
- * Ashby's end, and a mis-switch (or a race with another request) would land
- * candidate data in the wrong client's ATS. Throws `wrong_org_context`
- * when the post-switch session reports a different org.
+ * Switch into an org's context and, for writes, VERIFY the switch landed where
+ * intended. Every write path must go through this with a `jobId`: org context
+ * is server-side state on Ashby's end, and a mis-switch (or a race with DK's
+ * own browser) would land candidate data in the wrong client's ATS. Throws
+ * `WrongOrgContextError` when the org can't be proven. See org-verify.ts for
+ * why membership of the target job is the proof.
  */
 export async function enterOrgContext(
   session: AshbySession,
   userId: string,
   expectedOrgName: string,
-): Promise<{ orgId: string; orgName: string }> {
-  await switchOrgContext(session, userId); // refreshes CSRF eagerly inside
-  const verifyQuery = `
-    query ApiGetSessionUser {
-      user: sessionUserV2 {
-        id
-        organizationId
-        organizationName
-        __typename
-      }
-    }`;
-  const resp = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
-    session,
-    'ApiGetSessionUser',
-    verifyQuery,
-  );
-  const actual = (resp?.user?.organizationName || '').trim();
-  if (actual.toLowerCase() !== expectedOrgName.trim().toLowerCase()) {
-    throw new Error(
-      `wrong_org_context: expected "${expectedOrgName}" but session is in "${actual || 'unknown'}" — aborting before any write`,
-    );
+  opts: OrgVerifyOptions = {},
+): Promise<{ orgName: string; verifiedBy: 'identity+job_membership' | 'job_membership' | 'identity' | 'none' }> {
+  const nothingWritten = opts.nothingWritten ?? true;
+  // Layer 1 (reads and writes): what did the switch itself say it landed in?
+  const identity = await switchOrgContext(session, userId, opts.orgId); // refreshes CSRF eagerly inside
+  if (identity === 'mismatch') {
+    throw new WrongOrgContextError('identity_mismatch', expectedOrgName, { nothingWritten });
   }
-  return { orgId: resp.user.organizationId, orgName: actual };
+  if (!opts.jobId) return { orgName: expectedOrgName, verifiedBy: identity === 'match' ? 'identity' : 'none' };
+  // Layer 2 (writes): the target job is in this org right now. Catches what
+  // layer 1 can't: DK's own browser moving the context after the switch.
+  await verifyJobMembership(() => fetchOpenJobsForOrg(session), opts.jobId, expectedOrgName, { nothingWritten });
+  return { orgName: expectedOrgName, verifiedBy: identity === 'match' ? 'identity+job_membership' : 'job_membership' };
+}
+
+/**
+ * Check the CURRENT org context without switching. Run immediately after the
+ * blank draft is created: re-switching first would only prove where the
+ * session is now, not where the draft just landed.
+ */
+export async function verifyCurrentOrgHasJob(
+  session: AshbySession,
+  jobId: string,
+  expectedOrgName: string,
+  draftCandidateId: string,
+): Promise<void> {
+  await verifyJobMembership(() => fetchOpenJobsForOrg(session), jobId, expectedOrgName, {
+    nothingWritten: false,
+    draftCandidateId,
+    mismatchReason: 'post_create_mismatch',
+  });
 }
 
 /**
@@ -628,39 +652,14 @@ export async function fetchAvailableOrgs(session: AshbySession): Promise<OrgInfo
     return allOrgs.map(org => ({ id: org.id, name: org.name }));
   }
 
-  // Fallback: get current org from session user query
-  const sessionUserQuery = `
-    query ApiGetSessionUser {
-      user: sessionUserV2 {
-        id
-        organizationId
-        organizationName
-        __typename
-      }
-    }
-  `;
-
-  try {
-    const response = await graphqlQuery<{ user: { organizationId: string; organizationName: string } }>(
-      session,
-      'ApiGetSessionUser',
-      sessionUserQuery
-    );
-    
-    if (response.user.organizationId) {
-      return [{
-        id: response.user.organizationId,
-        name: response.user.organizationName || response.user.organizationId
-      }];
-    }
-    return [];
-  } catch (error) {
-    console.error('Error fetching available orgs:', error);
-    return [];
-  }
+  // There used to be a single-org fallback here that read the current org from
+  // `sessionUserV2`. Ashby removed that field (2026-08-26), so the fallback
+  // could only ever send a query known to be invalid. No identities means no
+  // orgs.
+  return [];
 }
 
-async function switchOrgContext(session: AshbySession, userId: string): Promise<void> {
+async function switchOrgContext(session: AshbySession, userId: string, orgId?: string): Promise<IdentityVerdict> {
   const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
 
   const res = await doFetch(session, url, {
@@ -673,6 +672,19 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
     throw new Error(`Failed to switch org context: ${res.status} ${res.statusText}. Response: ${errorText.substring(0, 200)}`);
   }
 
+  // The body was always discarded. Log its key NAMES once per process: if it
+  // names the identity we switched into, org verification can read it from a
+  // request we already make instead of spending a query. Never log values.
+  let verdict: IdentityVerdict = 'unknown';
+  try {
+    const text = await res.text();
+    const body = text ? JSON.parse(text) : null;
+    logShapeOnce('change_user response', body ?? '(empty body)');
+    verdict = verdictFromSwitchBody(body, { userId, orgId });
+  } catch {
+    logShapeOnce('change_user response', '(not JSON)');
+  }
+
   // Set-Cookie mirroring happens centrally in doFetch — the org switch's
   // session updates are already in session.cookies by the time we get here.
 
@@ -683,6 +695,7 @@ async function switchOrgContext(session: AshbySession, userId: string): Promise<
   // live when the enrichment pass queried right after a switch without
   // refreshing, killing every subsequent request in the run.
   session.csrfToken = await fetchCsrfToken(session);
+  return verdict;
 }
 
 interface AvailableIdentityResponse {
@@ -724,7 +737,10 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   }
 
   const identities = await res.json() as AvailableIdentityResponse[];
-  
+  // Key names only, once per process: does an identity carry a current/active
+  // flag that org verification could read? See org-verify.ts.
+  logShapeOnce('available_identities entry', identities?.[0]);
+
   // Map to OrgInfoWithUserId, deduplicating by organizationId (keep first userId for each org)
   const orgMap = new Map<string, OrgInfoWithUserId>();
   for (const identity of identities) {

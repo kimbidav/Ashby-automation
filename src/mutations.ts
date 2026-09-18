@@ -263,9 +263,22 @@ export interface NewCandidateInput {
  * candidate exists at that point and the caller's partial-failure handling
  * takes over.
  */
+export interface CreateCandidateHooks {
+  /**
+   * Runs once the blank draft exists and BEFORE any field is set. `addCandidate`
+   * takes no arguments, so it is the one write that lands in whatever org the
+   * session happens to be in; every later mutation is keyed by candidate id.
+   * The caller verifies the org here and throws to stop: the worst a race can
+   * then leave behind is a blank, unpublished (invisible) draft, never a named
+   * candidate in the wrong client's ATS.
+   */
+  afterDraft?: (candidateId: string) => Promise<void>;
+}
+
 export async function createCandidateWithDetails(
   session: AshbySession,
   input: NewCandidateInput,
+  hooks: CreateCandidateHooks = {},
 ): Promise<{ candidateId: string; warnings: string[] }> {
   const created = await graphqlMutation<{ candidate: { id: string } }>(
     session,
@@ -274,6 +287,7 @@ export async function createCandidateWithDetails(
   );
   const candidateId = created?.candidate?.id;
   if (!candidateId) throw new Error('addCandidate returned no id');
+  if (hooks.afterDraft) await hooks.afterDraft(candidateId);
   const warnings: string[] = [];
 
   const trySet = async (label: string, fn: () => Promise<unknown>) => {

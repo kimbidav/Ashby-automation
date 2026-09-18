@@ -27,7 +27,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
-import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, enterOrgContext, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
+import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, enterOrgContext, verifyCurrentOrgHasJob, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
+import { isWrongOrgContextError, wrongOrgResponseBody, isSessionAuthFailure } from './org-verify.js';
 import {
   searchCandidatesInOrg,
   fetchSourceIdByTitle,
@@ -513,7 +514,16 @@ function formatResult(data: ExtractResult & { extraction_stats?: Record<string, 
 function handleExtractionError(err: any, res: express.Response) {
   const message = err?.message || String(err);
 
-  if (message.includes('401') || message.includes('expired') || message.includes('CSRF')) {
+  // Wrong-org aborts first, and as 409: the coordinator backend passes 409
+  // through verbatim, so the UI can say "nothing was written" (or name the
+  // blank draft) instead of a generic "Extraction failed."
+  if (isWrongOrgContextError(err)) {
+    console.error(`Org verification failed (${err.reason}):`, message);
+    res.status(409).json(wrongOrgResponseBody(err));
+    return;
+  }
+
+  if (isSessionAuthFailure(message)) {
     res.status(401).json({
       error: 'Session expired or invalid. Please paste a fresh cookie from Ashby.',
       detail: message,
@@ -605,7 +615,11 @@ app.post('/api/applications/open-jobs', async (req: express.Request, res: expres
       if (!org) {
         return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
       }
-      await enterOrgContext(validation.session, org.userId, org.name);
+      // A read has no job id to check, so it is verified by identity only:
+      // the `change_user` response must name this org (`org_verification`
+      // reports what was proven). Writes additionally require the chosen job
+      // to be in this org's open jobs before anything is created.
+      const entered = await enterOrgContext(validation.session, org.userId, org.name, { orgId: org.id });
       const jobs = await fetchOpenJobsForOrg(validation.session);
       let sourceId: string | null = null;
       let sourceTitle: string | null = null;
@@ -624,6 +638,7 @@ app.post('/api/applications/open-jobs', async (req: express.Request, res: expres
         // available_identities returns the session user's identity per org,
         // so this userId IS the credited-to user id for that org.
         credited_to_user_id: org.userId,
+        org_verification: entered.verifiedBy,
       };
     });
     if ((payload as any).__status) {
@@ -681,13 +696,17 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       if (!org) {
         return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
       }
-      await enterOrgContext(session, org.userId, org.name);
+      // Entry: switch + verify before anything is read or written. The proof
+      // is that `jobId` is in this org's open jobs (see org-verify.ts), so a
+      // wrong org OR a job that closed since it was picked both abort here,
+      // with nothing written.
+      await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
       // Ashby's org context is PER-USER server state, not per-session: the
       // operator's own browsing in the Ashby web UI moves the same context
       // this session writes under. Re-entering (change_user + verify) before
       // each write step forces the context back and shrinks the race window
       // from the whole request to milliseconds per mutation group.
-      const reassertOrg = () => enterOrgContext(session, org.userId, org.name);
+      const reassertOrg = () => enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: false });
 
       const warnings: string[] = [];
       const steps: Record<string, string> = { candidate: 'pending', publish: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
@@ -731,12 +750,21 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
       if (candidateId) {
         steps.candidate = 'existing';
       } else {
+        // `addCandidate` takes no arguments: it is the one write that lands
+        // in whatever org the session is in. The duplicate check above took
+        // several seconds, so re-enter + verify immediately before it, then
+        // check again (WITHOUT switching) the moment the blank draft exists.
+        // A failure there throws out of the whole request before any field
+        // is set or the draft is published.
+        await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
         const created = await createCandidateWithDetails(session, {
           name: candName,
           email: typeof cand.email === 'string' && cand.email.trim() ? cand.email.trim() : null,
           linkedinUrl: typeof cand.linkedin_url === 'string' && cand.linkedin_url.trim() ? cand.linkedin_url.trim() : null,
           sourceId,
           creditedToUserId,
+        }, {
+          afterDraft: (draftId) => verifyCurrentOrgHasJob(session, jobId, org.name, draftId),
         });
         candidateId = created.candidateId;
         warnings.push(...created.warnings);
