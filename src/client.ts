@@ -741,9 +741,14 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
 }
 
 export async function fetchPipelineForOrg(
-  session: AshbySession, 
-  orgId: string, 
-  userId?: string
+  session: AshbySession,
+  orgId: string,
+  userId?: string,
+  // Org display name from the identity enumeration (fetchAllAvailableOrgs).
+  // Ashby removed `sessionUserV2` from the internal schema (2026-08-26), which
+  // is where the sweep used to read the org name mid-query; the caller already
+  // has it, so we thread it in instead. See the sessionUserV2 removal below.
+  orgNameHint?: string,
 ): Promise<PipelineFetchResult> {
   // If we have a userId, switch to that org context first
   let switchedOrg = false;
@@ -951,23 +956,24 @@ ${applicationFieldsFragment}
         opaqueFilter
         __typename
       }
-      user: sessionUserV2 {
-        organizationId
-        organizationName
-        __typename
-      }
     }
   `;
 
+  // `user` (sessionUserV2) was removed from the query — Ashby deleted the field
+  // (2026-08-26). Kept optional so any stale reference degrades instead of
+  // throwing; orgName now comes from orgNameHint.
   interface InitialFetchResponse extends JobsPipelinesResponse, ApplicationsResponse {
-    user: { organizationId: string; organizationName: string };
+    user?: { organizationId: string; organizationName: string };
   }
 
   let jobsData: JobsPipelinesResponse;
   const allApplications: ApplicationResult[] = [];
   let cursor: string | null = null;
   let hasMore = true;
-  let orgName: string | undefined;
+  // Ashby removed `sessionUserV2` from the internal schema (2026-08-26), so the
+  // sweep can no longer read the org name mid-query. It comes from the identity
+  // enumeration the caller already did instead.
+  let orgName: string | undefined = orgNameHint;
 
   // Fallback query with minimal fields (no scorecard/interview enrichment)
   // Used when the full query triggers server errors for certain orgs
@@ -1105,10 +1111,6 @@ ${applicationFieldsFragment}
     cursor = initialData.result.nextCursor;
     hasMore = initialData.result.moreDataAvailable;
     console.log(`Fetched ${initialData.result.results.length} applications (total: ${allApplications.length}, more: ${hasMore})`);
-
-    if (initialData.user.organizationId === orgId) {
-      orgName = initialData.user.organizationName;
-    }
   } catch (error: any) {
     // If the full query fails (even after retries in graphqlQuery), try a fallback
     // with stripped-down fields (no scorecard data which can cause server errors)
@@ -1161,11 +1163,6 @@ ${applicationFieldsFragment}
             opaqueFilter
             __typename
           }
-          user: sessionUserV2 {
-            organizationId
-            organizationName
-            __typename
-          }
         }
       `;
 
@@ -1185,10 +1182,6 @@ ${applicationFieldsFragment}
         cursor = fallbackData.result.nextCursor;
         hasMore = fallbackData.result.moreDataAvailable;
         console.log(`  Fetched ${fallbackData.result.results.length} applications (fallback, total: ${allApplications.length}, more: ${hasMore})`);
-
-        if (fallbackData.user.organizationId === orgId) {
-          orgName = fallbackData.user.organizationName;
-        }
       } catch (fallbackError) {
         console.error('  Error in fallback fetch:', fallbackError);
         throw fallbackError;
