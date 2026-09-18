@@ -182,19 +182,20 @@ Job ids are org-unique, so membership proves the session is in the org that owns
   is published, so the worst a race leaves is a blank, invisible draft, never a named
   candidate in the wrong ATS. `reassertOrg` (switch + verify) still precedes the resume,
   application and note groups.
-- **Reads are unverified.** `open-jobs` has no job id to check against, returns
-  `org_verification: 'none'`, and writes nothing. A mis-switched read is caught at write
-  time (its job isn't in the right org), and the coordinator cross-checks returned job ids
-  against its snapshot. Residual, accepted: a silent switch failure at BOTH prefill and
-  confirm, for an org whose jobs the snapshot has never seen.
+- **Two layers.** (1) *Identity*, reads and writes: the body of the `change_user` call this
+  repo already makes names the identity it landed in (`user.id`, `user.organizationId`;
+  shape confirmed live 2026-09-18). A mismatch aborts (`identity_mismatch`); an unrecognised
+  shape is `unknown` and proves nothing either way. (2) *Job membership*, writes only:
+  catches what identity can't, DK's browser moving the context after the switch.
+  `open-jobs` reports what it proved in `org_verification` (`identity` | `none`). The
+  coordinator also cross-checks returned job ids against its snapshot.
 - **Errors are 409**, not 500: `handleExtractionError` checks `isWrongOrgContextError`
   first and returns `{error:'wrong_org_context', reason, nothing_written,
   draft_candidate_id?, detail, instructions}`; the coordinator passes 409 through
   verbatim. Messages carry no ids, and session-death detection is `/\b401\b/` rather
   than a substring, because a UUID can contain "401".
 - `switchOrgContext` and `fetchAllAvailableOrgs` log the **key names** (never values) of
-  the `change_user` body and an identity entry once per process. If either names the
-  current identity, verification can read it from a request already being made.
+  their responses once per process, so a future Ashby shape change is visible in the log.
 - Unit tests: `npm test` (`src/org-verify.test.ts`, node:test).
 
 Endpoints (`/api/applications/*`, behind `requireSecret` on Railway):
