@@ -139,6 +139,10 @@ test('request errors never carry the session cookie or CSRF token', () => {
   const raw = 'apiRequestContext.fetch: Timeout 15000ms exceeded.\nCall log:\n  - x-csrf-token: SECRETCSRF\n  - cookie: authenticated=true; ashby_session_token=s%3ASECRETSESSION';
   const safe = redactSecrets(raw);
   assert.equal(safe, 'apiRequestContext.fetch: Timeout 15000ms exceeded.');
+  assert.equal(
+    redactSecrets('Timeout 15000ms exceeded.\nCall log:\n  - → POST https://app.ashbyhq.com/api/graphql?op=ApiOpenJobs\n    - cookie: ashby_session_token=SECRET'),
+    'Timeout 15000ms exceeded. (POST https://app.ashbyhq.com/api/graphql?op=ApiOpenJobs)',
+  );
   assert.equal(redactSecrets('failed with ashby_session_token=s%3ASECRETSESSION; x'), 'failed with ashby_session_token=[redacted]; x');
   for (const out of [safe, redactSecrets('x-csrf-token: SECRETCSRF')]) assert.ok(!/SECRET/.test(out));
 });

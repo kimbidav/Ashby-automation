@@ -55,6 +55,17 @@ export function createAuthHeaders(session: AshbySession): Record<string, string>
 
 const REQUEST_TIMEOUT_MS = 15_000; // 15s per API call — fail fast, don't hang
 
+// Per-call override for the few queries known to outrun 15s. Safe as a module
+// variable because write-lock.ts serializes all session use in this process.
+let requestTimeoutOverride: number | null = null;
+
+/** A request that got no answer in time, in either transport. */
+export function isTimeoutError(err: any): boolean {
+  const m = err?.message || '';
+  // cross-fetch aborts ("aborted"); Playwright says "Timeout 15000ms exceeded".
+  return err?.type === 'aborted' || /abort/i.test(m) || /Timeout \d+ms exceeded/i.test(m);
+}
+
 function withTimeout(ms: number): AbortSignal {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), ms);
@@ -195,7 +206,7 @@ async function doFetch(
       method: init?.method || 'GET',
       headers: callerHeaders,
       data: init?.body,
-      timeout: REQUEST_TIMEOUT_MS,
+      timeout: requestTimeoutOverride ?? REQUEST_TIMEOUT_MS,
       failOnStatusCode: false,
     });
     return adaptPlaywrightResponse(res);
@@ -210,7 +221,7 @@ async function doFetch(
     method: init?.method || 'GET',
     headers,
     body: init?.body,
-    signal: withTimeout(REQUEST_TIMEOUT_MS),
+    signal: withTimeout(requestTimeoutOverride ?? REQUEST_TIMEOUT_MS),
   });
 
   // Ashby rotates session cookies on arbitrary responses, not just org
@@ -623,13 +634,24 @@ export async function fetchOpenJobsForOrg(
   // Ashby's first jobsPipelines hit after an org switch can exceed the 15s
   // transport timeout (same transient the sweep retries whole orgs for).
   // This is a read — one retry on abort is safe and keeps the modal usable.
-  let resp: { jobsPipelines: Array<{ jobId: string; jobTitle: string; jobLocationName: string | null; applicationCount: number }> };
+  // 2026-09-21: it outran 15s on EVERY attempt, for a 3-job org as much as a
+  // 31-job one, and in live-browser mode the old retry never fired (Playwright
+  // words a timeout differently from an abort), so uploads were dead until the
+  // query happened to be fast. Give it 45s and two retries, both transports.
+  let resp: { jobsPipelines: Array<{ jobId: string; jobTitle: string; jobLocationName: string | null; applicationCount: number }> } | undefined;
+  requestTimeoutOverride = 45_000;
   try {
-    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
-  } catch (err: any) {
-    if (err?.type !== 'aborted' && !/abort/i.test(err?.message || '')) throw err;
-    console.warn('  open-jobs: request timed out, retrying once...');
-    resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        resp = await graphqlQuery(session, 'ApiOpenJobs', query);
+        break;
+      } catch (err: any) {
+        if (!isTimeoutError(err) || attempt >= 3) throw err;
+        console.warn(`  open-jobs: request timed out, retrying (${attempt}/2)...`);
+      }
+    }
+  } finally {
+    requestTimeoutOverride = null;
   }
   return (resp?.jobsPipelines || []).map((j) => ({
     id: j.jobId,

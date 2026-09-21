@@ -152,7 +152,12 @@ export function wrongOrgResponseBody(err: WrongOrgContextError): Record<string, 
 export function redactSecrets(message: string): string {
   let m = message || '';
   const cut = m.indexOf('Call log:');
-  if (cut !== -1) m = m.slice(0, cut).trimEnd();
+  if (cut !== -1) {
+    // Keep the one line that says WHICH request failed; drop the headers.
+    // The GraphQL operation name is the only query parameter worth keeping.
+    const target = m.slice(cut).match(/→\s+([A-Z]+\s+https?:\/\/[^\s?]+)(?:\?(?:[^\s]*&)?(op=[A-Za-z0-9_]+))?/);
+    m = m.slice(0, cut).trimEnd() + (target ? ` (${target[1]}${target[2] ? '?' + target[2] : ''})` : '');
+  }
   return m
     .replace(/(ashby_session_token|x-csrf-token|cookie|authorization)\s*[:=]\s*[^\s;,]+/gi, '$1=[redacted]')
     .replace(/\u001b\[[0-9;]*m/g, '');
