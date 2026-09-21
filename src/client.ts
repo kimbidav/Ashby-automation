@@ -627,13 +627,16 @@ export async function fetchOpenJobsForOrg(
         jobId
         jobTitle
         jobLocationName
-        applicationCount
         __typename
       }
     }`;
   // Ashby's first jobsPipelines hit after an org switch can exceed the 15s
   // transport timeout (same transient the sweep retries whole orgs for).
   // This is a read — one retry on abort is safe and keeps the modal usable.
+  // `applicationCount` is deliberately NOT requested: it makes Ashby count the
+  // applications on every job, and for a big org (Valon Tech, 31 open jobs)
+  // the query ran ~90s and then died server-side with "Unidentified server
+  // error". Nothing in the job picker uses the count.
   // 2026-09-21: it outran 15s on EVERY attempt, for a 3-job org as much as a
   // 31-job one, and in live-browser mode the old retry never fired (Playwright
   // words a timeout differently from an abort), so uploads were dead until the
