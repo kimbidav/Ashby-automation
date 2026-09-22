@@ -95,6 +95,8 @@ interface CachedResult {
     candidates: any[];
     // Authoritative swept-org names (real client orgs, not candidate employers).
     orgs?: string[];
+    // Open jobs per swept org (seeds the coordinator's Add-to-Ashby job cache).
+    open_jobs?: unknown[];
   };
 }
 
@@ -529,6 +531,7 @@ function formatResult(data: ExtractResult & { extraction_stats?: Record<string, 
     companies: data.companies,
     candidates: data.candidates,
     orgs: data.orgs,
+    open_jobs: data.open_jobs,
     extraction_stats: data.extraction_stats,
   };
 }

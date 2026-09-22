@@ -1326,7 +1326,8 @@ function normalizePipelineData(
       jobs.set(jobPipeline.jobId, {
         id: jobPipeline.jobId,
         title: jobPipeline.jobTitle,
-        companyId
+        companyId,
+        locationName: jobPipeline.jobLocationName ?? null,
       });
     }
   }

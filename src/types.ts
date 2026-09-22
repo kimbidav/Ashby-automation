@@ -23,6 +23,7 @@ export interface Job {
   id: string;
   title: string;
   companyId: string;
+  locationName?: string | null;
 }
 
 export interface InterviewFeedback {
