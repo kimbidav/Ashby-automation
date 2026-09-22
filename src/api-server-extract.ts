@@ -74,6 +74,17 @@ export interface ExtractResult {
   // inference. `companies` above is derived from each candidate's employer
   // (app.candidate.company) and must NOT be used for org-level detection.
   orgs: string[];
+  // Open jobs per swept org. The coordinator seeds its Add-to-Ashby job cache
+  // from this, so the Slack form never has to ask Ashby for a client's roles
+  // on its own (that query ran 2-16s, or ~90s and died for a big org).
+  open_jobs: OrgOpenJobs[];
+}
+
+export interface OrgOpenJobs {
+  org_name: string;
+  org_id: string;
+  credited_to_user_id: string;
+  jobs: Array<{ id: string; title: string; location: string | null }>;
 }
 
 function eventKey(event: InterviewEvent): string {
@@ -369,6 +380,13 @@ export async function extractPipeline(
 
   const allCompanies: Company[] = [];
   const allJobs: Job[] = [];
+  const openJobsByOrg: OrgOpenJobs[] = [];
+  const orgOpenJobs = (org: { id: string; name: string; userId: string }, jobs: Job[]): OrgOpenJobs => ({
+    org_name: org.name,
+    org_id: org.id,
+    credited_to_user_id: org.userId,
+    jobs: jobs.map((j) => ({ id: j.id, title: j.title, location: j.locationName ?? null })),
+  });
   let allCandidates: Candidate[] = [];
   let orgsFetched = 0;
   // Real client-org names that were successfully swept (includes orgs with zero
@@ -409,6 +427,7 @@ export async function extractPipeline(
       allCompanies.push(...companies);
       allJobs.push(...jobs);
       allCandidates.push(...candidates);
+      openJobsByOrg.push(orgOpenJobs(orgInfo, jobs));
       if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
       await sweepDoneForOrg(orgInfo, candidates);
@@ -445,6 +464,7 @@ export async function extractPipeline(
         allCompanies.push(...companies);
         allJobs.push(...jobs);
         allCandidates.push(...candidates);
+        openJobsByOrg.push(orgOpenJobs(orgInfo, jobs));
         if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
         orgsFetched++;
         await sweepDoneForOrg(orgInfo, candidates);
@@ -690,6 +710,7 @@ export async function extractPipeline(
     jobs: allJobs,
     candidates: flatCandidates,
     orgs: Array.from(sweptOrgNames),
+    open_jobs: openJobsByOrg,
     extraction_stats: {
       orgs_total: orgsWithUserId.length,
       orgs_fetched: orgsFetched,
