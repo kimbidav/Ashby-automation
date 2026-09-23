@@ -741,6 +741,15 @@ interface OrgInfoWithUserId extends OrgInfo {
   userId: string;
 }
 
+/** Same enumeration, keeping the login's email per identity (for seed verification). */
+export async function fetchAllAvailableOrgsWithEmail(session: AshbySession): Promise<Array<OrgInfoWithUserId & { email?: string }>> {
+  const all = await fetchAllAvailableOrgs(session);
+  return all.map((o) => ({ ...o, email: identityEmails.get(o.id) }));
+}
+
+// org id -> login email observed on the last enumeration (never logged).
+const identityEmails = new Map<string, string>();
+
 export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgInfoWithUserId[]> {
   // First, try to get a CSRF token to validate the session
   let csrfToken: string;
@@ -769,6 +778,7 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   // Map to OrgInfoWithUserId, deduplicating by organizationId (keep first userId for each org)
   const orgMap = new Map<string, OrgInfoWithUserId>();
   for (const identity of identities) {
+    if (identity.user?.email) identityEmails.set(identity.organization.id, identity.user.email);
     if (!orgMap.has(identity.organization.id)) {
       orgMap.set(identity.organization.id, {
         id: identity.organization.id,
@@ -1383,6 +1393,11 @@ function normalizePipelineData(
     const creditedTo = app.creditedToUser
       ? `${app.creditedToUser.firstName} ${app.creditedToUser.lastName}`.trim() || app.creditedToUser.email
       : null;
+    // Ids/emails were always fetched and previously discarded. Compass keys
+    // "my candidates" on the email (= the recruiter's login) instead of a
+    // display-name alias list.
+    const creditedToUserId = app.creditedToUser?.id ?? null;
+    const creditedToEmail = app.creditedToUser?.email ?? null;
 
     // Extract source
     const source = app.source?.title || null;
@@ -1471,6 +1486,8 @@ function normalizePipelineData(
       daysInStage,
       needsScheduling,
       creditedTo,
+      creditedToUserId,
+      creditedToEmail,
       source,
       decisionStatus: app.applicationStatus?.description || null,
       statusPriority: app.applicationStatus?.priority || null,
@@ -1596,6 +1613,8 @@ export async function fetchArchivedForOrg(
         const creditedTo = app?.creditedToUser
           ? `${app.creditedToUser.firstName} ${app.creditedToUser.lastName}`.trim() || app.creditedToUser.email
           : null;
+        const creditedToUserId = app?.creditedToUser?.id ?? null;
+        const creditedToEmail = app?.creditedToUser?.email ?? null;
         const lastActivityAt = app?.createdAt || '';
 
         out.push({
@@ -1623,6 +1642,8 @@ export async function fetchArchivedForOrg(
           daysInStage: lastActivityAt ? computeDaysInStage(lastActivityAt) : 0,
           needsScheduling: false,
           creditedTo,
+      creditedToUserId,
+      creditedToEmail,
           source: app?.source?.title || null,
           decisionStatus: isPreInterview ? (app?.applicationStatus?.description || 'In Process') : (looksHired ? 'Hired' : 'Archived'),
           statusPriority: app?.applicationStatus?.priority ?? null,

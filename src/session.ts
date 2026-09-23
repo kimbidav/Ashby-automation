@@ -29,8 +29,9 @@ import { AshbySession } from './types.js';
 // session lives on a volume (e.g. /data/ashby-session.json) instead.
 const SESSION_FILE = process.env.ASHBY_SESSION_FILE || path.join(process.cwd(), '.ashby-session.json');
 
-// Serializes session-file writes so concurrent rotations can't interleave.
-let persistChain: Promise<void> = Promise.resolve();
+// Serializes session-file writes so concurrent rotations can't interleave —
+// one chain per target file (the team file, or a recruiter's own file).
+const persistChains = new Map<string, Promise<void>>();
 
 /**
  * Persist the session's current cookie map to .ashby-session.json.
@@ -56,30 +57,53 @@ export function persistSessionCookies(session: AshbySession): Promise<void> {
     return Promise.resolve();
   }
 
-  // Snapshot now — the map may mutate again before the queued write runs.
-  const payload = JSON.stringify(
-    {
-      cookies: { ...session.cookies },
-      csrfToken: session.csrfToken,
-      orgIds: session.orgIds,
-      persistedAt: new Date().toISOString(),
-      ...(session.seedHash ? { seedHash: session.seedHash } : {}),
-    },
-    null,
-    2
-  );
+  const target = session.persistPath || SESSION_FILE;
+  // A recruiter's own file keeps its identity fields; the team file keeps its
+  // legacy shape. Either way the cookie map is what rotates.
+  const isUserFile = !!session.persistPath;
 
-  persistChain = persistChain.then(async () => {
-    const tmpFile = `${SESSION_FILE}.tmp`;
+  const prev = persistChains.get(target) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    const tmpFile = `${target}.tmp`;
     try {
-      await fs.writeFile(tmpFile, payload, 'utf8');
-      await fs.rename(tmpFile, SESSION_FILE);
-      console.log('✓ Persisted rotated session cookies to .ashby-session.json');
+      let payload: string;
+      if (isUserFile) {
+        // Merge into the stored per-user record so status/identity survive.
+        const { encodeSessionFile, decodeSessionFile } = await import('./sessions.js');
+        let existing: Record<string, unknown> = {};
+        try { existing = JSON.parse(decodeSessionFile(await fs.readFile(target, 'utf8'))); } catch { /* first write */ }
+        payload = encodeSessionFile(JSON.stringify({
+          ...existing,
+          cookies: { ...session.cookies },
+          csrfToken: session.csrfToken,
+          userEmail: session.userEmail ?? existing.userEmail,
+          identityUserIds: session.identityUserIds ?? existing.identityUserIds ?? {},
+          persistedAt: new Date().toISOString(),
+          ...(session.seedHash ? { seedHash: session.seedHash } : {}),
+        }, null, 2));
+      } else {
+        // Snapshot now — the map may mutate again before the queued write runs.
+        payload = JSON.stringify(
+          {
+            cookies: { ...session.cookies },
+            csrfToken: session.csrfToken,
+            orgIds: session.orgIds,
+            persistedAt: new Date().toISOString(),
+            ...(session.seedHash ? { seedHash: session.seedHash } : {}),
+          },
+          null,
+          2
+        );
+      }
+      await fs.writeFile(tmpFile, payload, { encoding: 'utf8', mode: 0o600 });
+      await fs.rename(tmpFile, target);
+      console.log(`✓ Persisted rotated session cookies to ${isUserFile ? 'user session' : '.ashby-session.json'}`);
     } catch (err: any) {
       console.warn(`⚠ Failed to persist rotated session cookies: ${err?.message || err}`);
     }
   });
-  return persistChain;
+  persistChains.set(target, next);
+  return next;
 }
 
 export async function saveSessionFromContext(context: BrowserContext): Promise<AshbySession> {

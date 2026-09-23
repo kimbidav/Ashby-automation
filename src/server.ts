@@ -27,7 +27,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
 import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
-import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, enterOrgContext, verifyCurrentOrgHasJob, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
+import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, fetchAllAvailableOrgsWithEmail, enterOrgContext, verifyCurrentOrgHasJob, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
 import { isWrongOrgContextError, wrongOrgResponseBody, isSessionAuthFailure, redactSecrets } from './org-verify.js';
 import {
   searchCandidatesInOrg,
@@ -39,7 +39,8 @@ import {
   fetchJobEntryStage,
   addNoteToCandidate,
 } from './mutations.js';
-import { withGlobalLock, lockHolder } from './write-lock.js';
+import { withGlobalLock, withLock, lockHolder, identityLockKey, TEAM_LOCK_KEY } from './write-lock.js';
+import { loadUserSession, readUserSessionFile, writeUserSessionFile, updateUserSessionFile, deleteUserSession, listUserSessions, normalizeEmail, SESSIONS_DIR } from './sessions.js';
 import { loadSession, persistSessionCookies } from './session.js';
 import { AshbySession } from './types.js';
 import { getAuthUrl, exchangeCode, addEventsToCalendar, CalendarEventRequest } from './google-calendar.js';
@@ -144,12 +145,17 @@ function cleanupOldJobs() {
 
 // Bump on behavior changes so a curl to /api/health confirms which build a
 // deployment (e.g. Railway) is actually running.
-const BUILD_STAMP = '2026-07-11-orgs-and-archived-sweep';
+const BUILD_STAMP = '2026-09-23-per-user-sessions';
 
-app.get('/api/health', (_req: express.Request, res: express.Response) => {
+app.get('/api/health', async (_req: express.Request, res: express.Response) => {
+  const userSessions = await listUserSessions().catch(() => []);
   res.json({
     status: 'ok',
     build: BUILD_STAMP,
+    user_sessions: userSessions.length,
+    user_sessions_healthy: userSessions.filter((u) => u.status === 'healthy').length,
+    team_lock_holder: lockHolder(TEAM_LOCK_KEY),
+    require_user_identity: REQUIRE_USER_IDENTITY,
     timestamp: new Date().toISOString(),
     stored_cookie_configured: !!STORED_COOKIE,
     shared_secret_required: !!SHARED_SECRET,
@@ -225,6 +231,67 @@ function liveSessionFromContext(ctx: BrowserContext, csrfToken?: string): AshbyS
     orgIds: [],
     requestContext: ctx.request,
   };
+}
+
+// ── Per-recruiter identity ────────────────────────────────────────────────
+//
+// Writes must run under the RECRUITER'S OWN Ashby login (credited-to and org
+// visibility are then theirs by construction). The caller names the identity
+// with `X-Ashby-User: <email>`; the matching session comes from sessions.ts.
+// There is deliberately NO fallback to the team session for writes: a write
+// under the wrong login is credited to the wrong person.
+
+const USER_HEADER = 'x-ashby-user';
+// Hosted (Railway, many recruiters): every write MUST name its recruiter.
+// Local single-user runs (the desktop coordinator): the team session IS the
+// operator's own login, so writes without the header stay allowed.
+const REQUIRE_USER_IDENTITY = process.env.ASHBY_REQUIRE_USER_IDENTITY === '1';
+
+function userEmailFrom(req: express.Request): string {
+  const raw = req.get(USER_HEADER);
+  return raw ? normalizeEmail(raw) : '';
+}
+
+type Resolved = { session: AshbySession; lockKey: string } | { error: string; status: number; detail?: string };
+
+/**
+ * The session a route should use. With `X-Ashby-User`, the recruiter's own
+ * session (401 user_session_missing when they never connected). Without it,
+ * the team session via validateCookie — reads only; write routes pass
+ * `requireUser`.
+ */
+async function resolveSession(req: express.Request, opts: { requireUser?: boolean } = {}): Promise<Resolved> {
+  const email = userEmailFrom(req);
+  if (email) {
+    const session = await loadUserSession(email);
+    if (!session) {
+      return { error: 'user_session_missing', status: 401, detail: `No Ashby login on file for ${email}. Connect Ashby in Candidate Compass.` };
+    }
+    session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+    return { session, lockKey: identityLockKey(email) };
+  }
+  if (opts.requireUser && REQUIRE_USER_IDENTITY) {
+    return { error: 'user_session_missing', status: 401, detail: 'Writes require X-Ashby-User: the recruiter whose Ashby login the upload runs under.' };
+  }
+  const validation = await validateCookie(req.body?.cookie);
+  if ('error' in validation) return validation;
+  return { session: validation.session, lockKey: TEAM_LOCK_KEY };
+}
+
+/** Like handleExtractionError, but a dead per-user login is named as such and recorded. */
+function handleRouteError(err: any, res: express.Response, session?: AshbySession) {
+  const message = redactSecrets(err?.message || String(err));
+  if (session?.userEmail && !isWrongOrgContextError(err) && isSessionAuthFailure(message)) {
+    void updateUserSessionFile(session.userEmail, { status: 'expired', lastError: message.slice(0, 200) });
+    res.status(401).json({
+      error: 'user_session_expired',
+      user: session.userEmail,
+      detail: message,
+      instructions: 'Your Ashby login for Candidate Compass has expired. Reconnect Ashby, then try again.',
+    });
+    return;
+  }
+  handleExtractionError(err, res);
 }
 
 // ── Cookie validation helper ──────────────────────────────────────────────
@@ -626,29 +693,36 @@ function ashbyCandidateUrl(candidateId: string, applicationId: string | null): s
 }
 
 const CANDIDATE_LABS_SOURCE_TITLE = process.env.ASHBY_SOURCE_TITLE || 'Sourced: Candidate Labs';
+// A hung upload must not brick a recruiter for the day: their lock is released
+// for the next call after this long even if the stuck call is still running.
+const WRITE_MAX_HOLD_MS = 300_000;
 
 app.post('/api/applications/open-jobs', async (req: express.Request, res: express.Response) => {
-  const validation = await validateCookie(req.body?.cookie);
-  if ('error' in validation) {
-    res.status(validation.status).json({ error: validation.error });
+  // The job picker for an upload: it must show the ORGS AND JOBS THIS
+  // RECRUITER'S SEAT can see, so it runs under their own session.
+  const resolved = await resolveSession(req, { requireUser: true });
+  if ('error' in resolved) {
+    res.status(resolved.status).json({ error: resolved.error, detail: resolved.detail });
     return;
   }
+  const validation = resolved;
   const orgName = typeof req.body?.org_name === 'string' ? req.body.org_name : '';
-  // Fast-fail when a sweep (or another write) holds the global lock —
-  // queueing a modal request behind a 15-minute extraction reads as a hang.
+  // Fast-fail when THIS identity is busy (its own upload in flight) —
+  // queueing a modal request behind a long call reads as a hang. Another
+  // recruiter's work, or the team sweep, is a different lock and never blocks.
   {
-    const holder = lockHolder();
+    const holder = lockHolder(resolved.lockKey);
     if (holder) {
       res.status(503).json({
         error: 'extractor_busy',
         holder,
-        instructions: 'An Ashby refresh sweep is running. Try again when it finishes (usually a few minutes).',
+        instructions: 'Your previous Ashby request is still running. Try again in a moment.',
       });
       return;
     }
   }
   try {
-    const payload = await withGlobalLock('open-jobs', async () => {
+    const payload = await withLock(resolved.lockKey, 'open-jobs', async () => {
       const orgs = (await fetchAllAvailableOrgs(validation.session)).filter((o) => o.userId);
       const org = resolveOrgByName(orgs, orgName);
       if (!org) {
@@ -687,7 +761,7 @@ app.post('/api/applications/open-jobs', async (req: express.Request, res: expres
     }
     res.json(payload);
   } catch (err: any) {
-    handleExtractionError(err, res);
+    handleRouteError(err, res, validation.session);
   }
 });
 
@@ -698,12 +772,211 @@ app.post('/api/applications/open-jobs', async (req: express.Request, res: expres
 // Partial-failure contract: once the candidate exists, downstream failures
 // come back as HTTP 200 with a per-step status map; the caller retries by
 // resending with existing_candidate_id.
+// The upload itself, shared by the synchronous route (dashboard) and the
+// job route (Slack shortcut via callback). Runs under the caller's identity
+// lock; `session` is the recruiter's own login.
+async function runAddCandidate(session: AshbySession, body: any): Promise<Record<string, unknown>> {
+  const orgName = typeof body.org_name === 'string' ? body.org_name : '';
+  const jobId = typeof body.job_id === 'string' ? body.job_id : '';
+  const cand = body.candidate || {};
+  const candName = typeof cand.name === 'string' ? cand.name.trim() : '';
+      const orgs = (await fetchAllAvailableOrgs(session)).filter((o) => o.userId);
+  const org = resolveOrgByName(orgs, orgName);
+  if (!org) {
+return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
+  }
+  // Entry: switch + verify before anything is read or written. The proof
+  // is that `jobId` is in this org's open jobs (see org-verify.ts), so a
+  // wrong org OR a job that closed since it was picked both abort here,
+  // with nothing written.
+  await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
+  // Ashby's org context is PER-USER server state, not per-session: the
+  // operator's own browsing in the Ashby web UI moves the same context
+  // this session writes under. Re-entering (change_user + verify) before
+  // each write step forces the context back and shrinks the race window
+  // from the whole request to milliseconds per mutation group.
+  const reassertOrg = () => enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: false });
+
+  const warnings: string[] = [];
+  const steps: Record<string, string> = { candidate: 'pending', publish: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
+  const normLi = (u: string) =>
+(u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('?')[0].replace(/\/+$/, '');
+
+  let candidateId: string = typeof body.existing_candidate_id === 'string' ? body.existing_candidate_id : '';
+
+  // Duplicate pre-check — BEFORE any write. LinkedIn slug match first,
+  // exact normalized name second.
+  if (!candidateId && body.skip_duplicate_check !== true) {
+const hits = await searchCandidatesInOrg(session, candName);
+const liWanted = cand.linkedin_url ? normLi(cand.linkedin_url) : '';
+const matches = hits.filter((h) => {
+  if (liWanted && h.linkedinUrl && normLi(h.linkedinUrl) === liWanted) return true;
+  return h.name.trim().toLowerCase() === candName.toLowerCase();
+});
+if (matches.length > 0) {
+  return {
+    __status: 409,
+    error: 'candidate_exists',
+    matches: matches.map((m) => ({ id: m.id, name: m.name, email: m.email, linkedin_url: m.linkedinUrl })),
+  };
+}
+  }
+
+  // Attribution ids — either passed through from the open-jobs prefill
+  // or resolved here. Soft-fail: an upload without attribution beats no
+  // upload; the warning is surfaced in the modal.
+  let sourceId: string | null = typeof body.source_id === 'string' ? body.source_id : null;
+  if (!sourceId) {
+try {
+  sourceId = (await fetchSourceIdByTitle(session, CANDIDATE_LABS_SOURCE_TITLE))?.id ?? null;
+} catch { /* soft-fail below */ }
+if (!sourceId) warnings.push(`source "${CANDIDATE_LABS_SOURCE_TITLE}" not found in this org — attribution skipped`);
+  }
+  // Credited-to is ALWAYS the identity this session belongs to. A caller
+  // may echo it back (the prefill returns it) but may not choose someone
+  // else: that would be one recruiter's upload credited to another.
+  if (typeof body.credited_to_user_id === 'string' && body.credited_to_user_id && body.credited_to_user_id !== org.userId) {
+return { __status: 400, error: 'credited_to_not_self', detail: 'credited_to_user_id must be the uploading recruiter (omit it).' };
+  }
+  const creditedToUserId: string | null = org.userId;
+
+  // Create (point of no return) — or reuse the retry path's id.
+  if (candidateId) {
+steps.candidate = 'existing';
+  } else {
+// `addCandidate` takes no arguments: it is the one write that lands
+// in whatever org the session is in. The duplicate check above took
+// several seconds, so re-enter + verify immediately before it, then
+// check again (WITHOUT switching) the moment the blank draft exists.
+// A failure there throws out of the whole request before any field
+// is set or the draft is published.
+await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
+const created = await createCandidateWithDetails(session, {
+  name: candName,
+  email: typeof cand.email === 'string' && cand.email.trim() ? cand.email.trim() : null,
+  linkedinUrl: typeof cand.linkedin_url === 'string' && cand.linkedin_url.trim() ? cand.linkedin_url.trim() : null,
+  sourceId,
+  creditedToUserId,
+}, {
+  afterDraft: (draftId) => verifyCurrentOrgHasJob(session, jobId, org.name, draftId),
+});
+candidateId = created.candidateId;
+warnings.push(...created.warnings);
+steps.candidate = 'created';
+  }
+
+  // Publish — addCandidate leaves the record as an invisible DRAFT
+  // (hidden from search, dup detection, and candidate pages), and
+  // createApplication dies on drafts. Runs on the retry path too so
+  // pre-fix orphan drafts get healed. Idempotent on published records.
+  try {
+await publishCandidate(session, candidateId);
+steps.publish = 'published';
+  } catch (err: any) {
+steps.publish = 'failed';
+warnings.push(`publish failed: ${err?.message?.substring(0, 120)}`);
+  }
+
+  // Resume — non-fatal.
+  if (body.resume?.content_base64 && body.resume?.filename) {
+try {
+  await reassertOrg();
+  await uploadResumeForCandidate(session, candidateId, {
+    filename: body.resume.filename,
+    contentBase64: body.resume.content_base64,
+  });
+  steps.resume = 'uploaded';
+} catch (err: any) {
+  steps.resume = 'failed';
+  warnings.push(`resume upload failed: ${err?.message?.substring(0, 150)}`);
+}
+  } else {
+steps.resume = 'skipped';
+  }
+
+  // Application — on the retry path, re-check for one on this job first
+  // (the restricted-summaries lookup returns every application with its
+  // job id, including ones this seat can't open).
+  let applicationId: string | null = null;
+  try {
+await reassertOrg();
+if (steps.candidate === 'existing') {
+  try {
+    const summaries = await fetchCandidateRestrictedSummaries(session, candidateId);
+    const existing = summaries.find((s) => s.jobId === jobId);
+    if (existing) {
+      applicationId = existing.applicationId;
+      steps.application = 'existing';
+    }
+  } catch { /* fall through to create */ }
+}
+if (!applicationId) {
+  // interviewPlanId is REQUIRED (the UI panel always supplies the
+  // job's default plan); the stage must stay null for this seat —
+  // see createApplicationForCandidate.
+  const plan = await fetchJobEntryStage(session, jobId);
+  if (!plan?.interviewPlanId) {
+    throw new Error(`no interview plan found for job ${jobId} — cannot create application`);
+  }
+  const created = await createApplicationForCandidate(session, {
+    candidateId,
+    jobId,
+    interviewPlanId: plan.interviewPlanId,
+    sourceId,
+    creditedToUserId,
+  });
+  applicationId = created.applicationId;
+  steps.application = 'created';
+}
+  } catch (err: any) {
+steps.application = 'failed';
+warnings.push(`application create failed: ${err?.message?.substring(0, 150)}`);
+  }
+
+  // Note — non-fatal.
+  if (typeof body.note_text === 'string' && body.note_text.trim()) {
+try {
+  await reassertOrg();
+  await addNoteToCandidate(session, candidateId, body.note_text);
+  steps.note = 'created';
+} catch (err: any) {
+  steps.note = 'failed';
+  warnings.push(`note create failed: ${err?.message?.substring(0, 150)}`);
+}
+  } else {
+steps.note = 'skipped';
+  }
+
+  // A write changes org state — cached sweep results are now stale.
+  resultCache = null;
+  clearOrgCache();
+
+  return {
+success: steps.application === 'created' || steps.application === 'existing',
+candidate_id: candidateId,
+application_id: applicationId,
+candidate_url: ashbyCandidateUrl(candidateId, applicationId),
+org_name: org.name,
+org_id: org.id,
+steps,
+warnings,
+  };
+}
+
+function validateAddCandidateBody(body: any): string | null {
+  const orgName = typeof body.org_name === 'string' ? body.org_name : '';
+  const jobId = typeof body.job_id === 'string' ? body.job_id : '';
+  const candName = typeof body.candidate?.name === 'string' ? body.candidate.name.trim() : '';
+  return orgName && jobId && candName ? null : 'org_name, job_id, and candidate.name are required';
+}
+
 app.post('/api/applications/add-candidate', async (req: express.Request, res: express.Response) => {
-  const validation = await validateCookie(req.body?.cookie);
-  if ('error' in validation) {
-    res.status(validation.status).json({ error: validation.error });
+  const resolved = await resolveSession(req, { requireUser: true });
+  if ('error' in resolved) {
+    res.status(resolved.status).json({ error: resolved.error, detail: resolved.detail });
     return;
   }
+  const validation = resolved;
   const body = req.body || {};
   const orgName = typeof body.org_name === 'string' ? body.org_name : '';
   const jobId = typeof body.job_id === 'string' ? body.job_id : '';
@@ -714,199 +987,21 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
     return;
   }
 
-  // Fast-fail when a sweep (or another write) holds the global lock —
-  // queueing a modal request behind a 15-minute extraction reads as a hang.
+  // Fast-fail when THIS identity already has a call in flight; other
+  // recruiters and the team sweep use different locks and never block this.
   {
-    const holder = lockHolder();
+    const holder = lockHolder(resolved.lockKey);
     if (holder) {
       res.status(503).json({
         error: 'extractor_busy',
         holder,
-        instructions: 'An Ashby refresh sweep is running. Try again when it finishes (usually a few minutes).',
+        instructions: 'Your previous Ashby request is still running. Try again in a moment.',
       });
       return;
     }
   }
   try {
-    const payload = await withGlobalLock('add-candidate', async () => {
-      const session = validation.session;
-      const orgs = (await fetchAllAvailableOrgs(session)).filter((o) => o.userId);
-      const org = resolveOrgByName(orgs, orgName);
-      if (!org) {
-        return { __status: 404, error: 'unknown_org', org_name: orgName, available: orgs.map((o) => o.name) };
-      }
-      // Entry: switch + verify before anything is read or written. The proof
-      // is that `jobId` is in this org's open jobs (see org-verify.ts), so a
-      // wrong org OR a job that closed since it was picked both abort here,
-      // with nothing written.
-      await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
-      // Ashby's org context is PER-USER server state, not per-session: the
-      // operator's own browsing in the Ashby web UI moves the same context
-      // this session writes under. Re-entering (change_user + verify) before
-      // each write step forces the context back and shrinks the race window
-      // from the whole request to milliseconds per mutation group.
-      const reassertOrg = () => enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: false });
-
-      const warnings: string[] = [];
-      const steps: Record<string, string> = { candidate: 'pending', publish: 'pending', resume: 'pending', application: 'pending', note: 'pending' };
-      const normLi = (u: string) =>
-        (u || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('?')[0].replace(/\/+$/, '');
-
-      let candidateId: string = typeof body.existing_candidate_id === 'string' ? body.existing_candidate_id : '';
-
-      // Duplicate pre-check — BEFORE any write. LinkedIn slug match first,
-      // exact normalized name second.
-      if (!candidateId && body.skip_duplicate_check !== true) {
-        const hits = await searchCandidatesInOrg(session, candName);
-        const liWanted = cand.linkedin_url ? normLi(cand.linkedin_url) : '';
-        const matches = hits.filter((h) => {
-          if (liWanted && h.linkedinUrl && normLi(h.linkedinUrl) === liWanted) return true;
-          return h.name.trim().toLowerCase() === candName.toLowerCase();
-        });
-        if (matches.length > 0) {
-          return {
-            __status: 409,
-            error: 'candidate_exists',
-            matches: matches.map((m) => ({ id: m.id, name: m.name, email: m.email, linkedin_url: m.linkedinUrl })),
-          };
-        }
-      }
-
-      // Attribution ids — either passed through from the open-jobs prefill
-      // or resolved here. Soft-fail: an upload without attribution beats no
-      // upload; the warning is surfaced in the modal.
-      let sourceId: string | null = typeof body.source_id === 'string' ? body.source_id : null;
-      if (!sourceId) {
-        try {
-          sourceId = (await fetchSourceIdByTitle(session, CANDIDATE_LABS_SOURCE_TITLE))?.id ?? null;
-        } catch { /* soft-fail below */ }
-        if (!sourceId) warnings.push(`source "${CANDIDATE_LABS_SOURCE_TITLE}" not found in this org — attribution skipped`);
-      }
-      const creditedToUserId: string | null =
-        typeof body.credited_to_user_id === 'string' ? body.credited_to_user_id : org.userId;
-
-      // Create (point of no return) — or reuse the retry path's id.
-      if (candidateId) {
-        steps.candidate = 'existing';
-      } else {
-        // `addCandidate` takes no arguments: it is the one write that lands
-        // in whatever org the session is in. The duplicate check above took
-        // several seconds, so re-enter + verify immediately before it, then
-        // check again (WITHOUT switching) the moment the blank draft exists.
-        // A failure there throws out of the whole request before any field
-        // is set or the draft is published.
-        await enterOrgContext(session, org.userId, org.name, { jobId, orgId: org.id, nothingWritten: true });
-        const created = await createCandidateWithDetails(session, {
-          name: candName,
-          email: typeof cand.email === 'string' && cand.email.trim() ? cand.email.trim() : null,
-          linkedinUrl: typeof cand.linkedin_url === 'string' && cand.linkedin_url.trim() ? cand.linkedin_url.trim() : null,
-          sourceId,
-          creditedToUserId,
-        }, {
-          afterDraft: (draftId) => verifyCurrentOrgHasJob(session, jobId, org.name, draftId),
-        });
-        candidateId = created.candidateId;
-        warnings.push(...created.warnings);
-        steps.candidate = 'created';
-      }
-
-      // Publish — addCandidate leaves the record as an invisible DRAFT
-      // (hidden from search, dup detection, and candidate pages), and
-      // createApplication dies on drafts. Runs on the retry path too so
-      // pre-fix orphan drafts get healed. Idempotent on published records.
-      try {
-        await publishCandidate(session, candidateId);
-        steps.publish = 'published';
-      } catch (err: any) {
-        steps.publish = 'failed';
-        warnings.push(`publish failed: ${err?.message?.substring(0, 120)}`);
-      }
-
-      // Resume — non-fatal.
-      if (body.resume?.content_base64 && body.resume?.filename) {
-        try {
-          await reassertOrg();
-          await uploadResumeForCandidate(session, candidateId, {
-            filename: body.resume.filename,
-            contentBase64: body.resume.content_base64,
-          });
-          steps.resume = 'uploaded';
-        } catch (err: any) {
-          steps.resume = 'failed';
-          warnings.push(`resume upload failed: ${err?.message?.substring(0, 150)}`);
-        }
-      } else {
-        steps.resume = 'skipped';
-      }
-
-      // Application — on the retry path, re-check for one on this job first
-      // (the restricted-summaries lookup returns every application with its
-      // job id, including ones this seat can't open).
-      let applicationId: string | null = null;
-      try {
-        await reassertOrg();
-        if (steps.candidate === 'existing') {
-          try {
-            const summaries = await fetchCandidateRestrictedSummaries(session, candidateId);
-            const existing = summaries.find((s) => s.jobId === jobId);
-            if (existing) {
-              applicationId = existing.applicationId;
-              steps.application = 'existing';
-            }
-          } catch { /* fall through to create */ }
-        }
-        if (!applicationId) {
-          // interviewPlanId is REQUIRED (the UI panel always supplies the
-          // job's default plan); the stage must stay null for this seat —
-          // see createApplicationForCandidate.
-          const plan = await fetchJobEntryStage(session, jobId);
-          if (!plan?.interviewPlanId) {
-            throw new Error(`no interview plan found for job ${jobId} — cannot create application`);
-          }
-          const created = await createApplicationForCandidate(session, {
-            candidateId,
-            jobId,
-            interviewPlanId: plan.interviewPlanId,
-            sourceId,
-            creditedToUserId,
-          });
-          applicationId = created.applicationId;
-          steps.application = 'created';
-        }
-      } catch (err: any) {
-        steps.application = 'failed';
-        warnings.push(`application create failed: ${err?.message?.substring(0, 150)}`);
-      }
-
-      // Note — non-fatal.
-      if (typeof body.note_text === 'string' && body.note_text.trim()) {
-        try {
-          await reassertOrg();
-          await addNoteToCandidate(session, candidateId, body.note_text);
-          steps.note = 'created';
-        } catch (err: any) {
-          steps.note = 'failed';
-          warnings.push(`note create failed: ${err?.message?.substring(0, 150)}`);
-        }
-      } else {
-        steps.note = 'skipped';
-      }
-
-      // A write changes org state — cached sweep results are now stale.
-      resultCache = null;
-      clearOrgCache();
-
-      return {
-        success: steps.application === 'created' || steps.application === 'existing',
-        candidate_id: candidateId,
-        application_id: applicationId,
-        candidate_url: ashbyCandidateUrl(candidateId, applicationId),
-        org_name: org.name,
-        org_id: org.id,
-        steps,
-        warnings,
-      };
-    });
+    const payload = await withLock(resolved.lockKey, 'add-candidate', () => runAddCandidate(validation.session, body), { maxHoldMs: WRITE_MAX_HOLD_MS });
     if ((payload as any).__status) {
       const { __status, ...bodyOut } = payload as any;
       res.status(__status).json(bodyOut);
@@ -914,8 +1009,124 @@ app.post('/api/applications/add-candidate', async (req: express.Request, res: ex
     }
     res.json(payload);
   } catch (err: any) {
-    handleExtractionError(err, res);
+    handleRouteError(err, res, validation.session);
   }
+});
+
+// ── Async upload (job + callback) ─────────────────────────────────────────
+//
+// A Slack-driven upload can take up to ~3 minutes, longer than an edge
+// function may wait. The shortcut therefore starts the upload here, gets a
+// job id back at once, and the result is POSTed to `callback_url` when the
+// upload finishes (HTTP status + the same JSON the sync route would return).
+// GET /api/applications/jobs/:id serves the result again if a callback is lost.
+
+interface UploadJob {
+  id: string;
+  user: string;
+  status: 'running' | 'completed' | 'failed';
+  created_at: string;
+  completed_at?: string;
+  http_status?: number;
+  result?: Record<string, unknown>;
+  callback_url?: string;
+  callback_ref?: string;
+  callback_delivered?: boolean;
+}
+const uploadJobs = new Map<string, UploadJob>();
+const UPLOAD_JOB_TTL_MS = 30 * 60 * 1000;
+const CALLBACK_SECRET = process.env.EXTRACTOR_CALLBACK_SECRET || '';
+
+function cleanupUploadJobs() {
+  const cutoff = Date.now() - UPLOAD_JOB_TTL_MS;
+  for (const [id, job] of uploadJobs) {
+    if (new Date(job.created_at).getTime() < cutoff) uploadJobs.delete(id);
+  }
+}
+
+async function deliverCallback(job: UploadJob): Promise<void> {
+  if (!job.callback_url) return;
+  const payload = JSON.stringify({ job_id: job.id, callback_ref: job.callback_ref ?? null, user: job.user, http_status: job.http_status, result: job.result });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 15000);
+      const res = await fetch(job.callback_url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(CALLBACK_SECRET ? { 'x-extractor-callback-secret': CALLBACK_SECRET } : {}) },
+        body: payload,
+        signal: ctl.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) { job.callback_delivered = true; return; }
+      console.warn(`[upload-job ${job.id}] callback returned ${res.status} (attempt ${attempt})`);
+    } catch (err: any) {
+      console.warn(`[upload-job ${job.id}] callback failed (attempt ${attempt}): ${redactSecrets(err?.message || String(err))}`);
+    }
+  }
+}
+
+app.post('/api/applications/add-candidate/start', async (req: express.Request, res: express.Response) => {
+  const resolved = await resolveSession(req, { requireUser: true });
+  if ('error' in resolved) {
+    res.status(resolved.status).json({ error: resolved.error, detail: resolved.detail });
+    return;
+  }
+  const body = req.body || {};
+  const invalid = validateAddCandidateBody(body);
+  if (invalid) {
+    res.status(400).json({ error: 'missing_fields', detail: invalid });
+    return;
+  }
+  cleanupUploadJobs();
+  const job: UploadJob = {
+    id: crypto.randomUUID(),
+    user: resolved.session.userEmail || '',
+    status: 'running',
+    created_at: new Date().toISOString(),
+    callback_url: typeof body.callback_url === 'string' ? body.callback_url : undefined,
+    callback_ref: typeof body.callback_ref === 'string' ? body.callback_ref : undefined,
+  };
+  uploadJobs.set(job.id, job);
+  const { session, lockKey } = resolved;
+
+  // Fire and forget under the recruiter's identity lock. Errors become a
+  // result payload shaped exactly like the sync route's error responses.
+  withLock(lockKey, 'add-candidate', () => runAddCandidate(session, body), { maxHoldMs: WRITE_MAX_HOLD_MS })
+    .then((payload) => {
+      const { __status, ...rest } = payload as any;
+      job.http_status = __status ?? 200;
+      job.result = rest;
+      job.status = 'completed';
+    })
+    .catch((err: any) => {
+      const capture = { status: 500, body: {} as Record<string, unknown> };
+      const fakeRes = { status(code: number) { capture.status = code; return this; }, json(b: Record<string, unknown>) { capture.body = b; } } as unknown as express.Response;
+      handleRouteError(err, fakeRes, session);
+      job.http_status = capture.status;
+      job.result = capture.body;
+      job.status = 'failed';
+    })
+    .finally(() => {
+      job.completed_at = new Date().toISOString();
+      void deliverCallback(job);
+    });
+
+  res.status(202).json({ job_id: job.id, status: 'running' });
+});
+
+app.get('/api/applications/jobs/:id', (req: express.Request, res: express.Response) => {
+  const job = uploadJobs.get(String(req.params.id));
+  if (!job) {
+    res.status(404).json({ error: 'job_not_found' });
+    return;
+  }
+  const email = userEmailFrom(req);
+  if (email && job.user && email !== job.user) {
+    res.status(403).json({ error: 'not_your_job' });
+    return;
+  }
+  res.json({ job_id: job.id, status: job.status, created_at: job.created_at, completed_at: job.completed_at ?? null, http_status: job.http_status ?? null, result: job.result ?? null, callback_delivered: job.callback_delivered ?? false });
 });
 
 // ── Shared-session seed + status ──────────────────────────────────────────
@@ -930,6 +1141,11 @@ app.post('/api/session/seed', async (req: express.Request, res: express.Response
   const cookie = typeof req.body?.cookie === 'string' ? req.body.cookie.trim() : '';
   if (!cookie) {
     res.status(400).json({ error: 'Missing cookie in request body.' });
+    return;
+  }
+  const userEmail = userEmailFrom(req);
+  if (userEmail) {
+    await seedUserSession(userEmail, cookie, res);
     return;
   }
   const session = createSessionFromCookie(cookie);
@@ -959,7 +1175,99 @@ app.post('/api/session/seed', async (req: express.Request, res: express.Response
   res.json({ authenticated: true, persisted_at: new Date().toISOString() });
 });
 
+/**
+ * A recruiter's own login. The pasted cookie must belong to the person it is
+ * being filed under: Ashby's identity list names the login's email, and a
+ * mismatch is refused before anything is stored (409 identity_mismatch).
+ * Otherwise a teammate's cookie pasted by mistake would credit every upload
+ * to the teammate.
+ */
+async function seedUserSession(userEmail: string, cookie: string, res: express.Response): Promise<void> {
+  const session = createSessionFromCookie(cookie);
+  if (!session.cookies['ashby_session_token'] && !session.cookies['authenticated']) {
+    res.status(400).json({ error: 'cookie_missing_token', detail: 'Cookie string is missing the ashby_session_token. Copy the full Cookie header value from DevTools.' });
+    return;
+  }
+  session.seedHash = crypto.createHash('sha256').update(cookie).digest('hex');
+  session.userEmail = userEmail;
+  // Rotations during the probe must land in THIS user's file, never the team file.
+  const { sessionPathFor } = await import('./sessions.js');
+  session.persistPath = sessionPathFor(userEmail);
+  session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+  let identities: Array<{ id: string; name: string; userId: string; email?: string }>;
+  try {
+    session.csrfToken = await fetchCsrfToken(session);
+    identities = await fetchAllAvailableOrgsWithEmail(session);
+  } catch (err: any) {
+    res.status(401).json({ error: 'cookie_not_authenticated', detail: redactSecrets(err?.message || String(err)) });
+    return;
+  }
+  const emails = new Set(identities.map((i) => normalizeEmail(i.email || '')).filter(Boolean));
+  if (emails.size === 0) {
+    res.status(422).json({ error: 'identity_unverifiable', detail: 'Ashby did not report an email for this login, so it cannot be matched to you. Nothing was stored.' });
+    return;
+  }
+  if (!emails.has(userEmail)) {
+    res.status(409).json({ error: 'identity_mismatch', detail: `That Ashby login belongs to a different account than ${userEmail}. Nothing was stored.` });
+    return;
+  }
+  const identityUserIds: Record<string, string> = {};
+  for (const i of identities) if (i.userId) identityUserIds[i.id] = i.userId;
+  await writeUserSessionFile(userEmail, {
+    cookies: session.cookies,
+    csrfToken: session.csrfToken,
+    seedHash: session.seedHash,
+    userEmail,
+    identityUserIds,
+    orgCount: Object.keys(identityUserIds).length,
+    seededAt: new Date().toISOString(),
+    status: 'healthy',
+    lastOkAt: new Date().toISOString(),
+  });
+  console.log(`[session-seed] per-user session seeded for ${userEmail} (${Object.keys(identityUserIds).length} orgs)`);
+  res.json({ authenticated: true, identity_verified: true, user: userEmail, org_count: Object.keys(identityUserIds).length, persisted_at: new Date().toISOString() });
+}
+
+/** Probe one recruiter's stored login: one CSRF GET, rotation persisted. */
+async function probeUserSession(email: string): Promise<{ authenticated: boolean; reason?: string }> {
+  const session = await loadUserSession(email);
+  if (!session) return { authenticated: false, reason: 'no_session' };
+  session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
+  try {
+    await fetchCsrfToken(session);
+    await updateUserSessionFile(email, { status: 'healthy', lastOkAt: new Date().toISOString(), lastError: undefined });
+    return { authenticated: true };
+  } catch (err: any) {
+    await updateUserSessionFile(email, { status: 'expired', lastError: redactSecrets(err?.message || String(err)).slice(0, 200) });
+    return { authenticated: false, reason: 'expired' };
+  }
+}
+
+app.get('/api/session/users', async (_req: express.Request, res: express.Response) => {
+  res.json({ users: await listUserSessions() });
+});
+
+app.delete('/api/session/user', async (req: express.Request, res: express.Response) => {
+  const email = userEmailFrom(req);
+  if (!email) {
+    res.status(400).json({ error: 'missing_user' });
+    return;
+  }
+  res.json({ deleted: await deleteUserSession(email) });
+});
+
 app.get('/api/session/status', async (_req: express.Request, res: express.Response) => {
+  const userEmail = userEmailFrom(_req);
+  if (userEmail) {
+    const stored = await readUserSessionFile(userEmail);
+    if (!stored) {
+      res.json({ authenticated: false, reason: 'no_session', user: userEmail });
+      return;
+    }
+    const probe = await probeUserSession(userEmail);
+    res.json({ ...probe, user: userEmail, persisted_at: stored.persistedAt ?? null, seeded_at: stored.seededAt, org_count: stored.orgCount });
+    return;
+  }
   let session: AshbySession;
   try {
     session = await loadSession();
@@ -1195,6 +1503,23 @@ app.post('/api/calendar/add', async (req: express.Request, res: express.Response
     res.status(500).json({ error: 'Failed to add calendar events.', detail: err?.message });
   }
 });
+
+// Every recruiter's stored login is probed a few times a day (one cheap CSRF
+// GET each) so Compass can nudge them to reconnect BEFORE a click fails.
+const USER_PROBE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+async function probeAllUserSessions() {
+  const users = await listUserSessions().catch(() => []);
+  for (const u of users) {
+    try {
+      const r = await probeUserSession(u.email);
+      console.log(`[session-probe] ${u.email}: ${r.authenticated ? 'healthy' : r.reason}`);
+    } catch (err: any) {
+      console.warn(`[session-probe] ${u.email}: ${redactSecrets(err?.message || String(err))}`);
+    }
+  }
+}
+setTimeout(() => { void probeAllUserSessions(); }, 60_000).unref();
+setInterval(() => { void probeAllUserSessions(); }, USER_PROBE_INTERVAL_MS).unref();
 
 app.listen(PORT, () => {
   console.log(`Ashby extraction API listening on port ${PORT}`);
