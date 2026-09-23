@@ -48,6 +48,8 @@ export interface ExtractedCandidate {
   days_in_stage: number;
   needs_scheduling: boolean;
   credited_to: string;
+  credited_to_user_id?: string | null;
+  credited_to_email?: string | null;
   source: string;
   // True when the row was synthesized from a restricted-application summary
   // (session user can't open the application — stage + title only, no
@@ -671,6 +673,8 @@ export async function extractPipeline(
       days_in_stage: cand.daysInStage,
       needs_scheduling: cand.needsScheduling,
       credited_to: cand.creditedTo ?? '',
+      credited_to_user_id: cand.creditedToUserId ?? null,
+      credited_to_email: cand.creditedToEmail ?? null,
       source: cand.source ?? '',
       access_restricted: cand.accessRestricted ?? false,
       feedback_count: cand.feedbackCount ?? 0,

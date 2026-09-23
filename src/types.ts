@@ -81,6 +81,8 @@ export interface Candidate {
   daysInStage: number;
   needsScheduling: boolean;
   creditedTo: string | null;
+  creditedToUserId?: string | null;
+  creditedToEmail?: string | null;
   source: string | null;
 
   // Application status
@@ -150,4 +152,14 @@ export interface AshbySession {
    * cookie or predates it. Persisted alongside the cookie map.
    */
   seedHash?: string;
+  /**
+   * Where rotations are persisted. Unset = the team session file
+   * (ASHBY_SESSION_FILE); a recruiter's own session points at their file
+   * under ASHBY_SESSIONS_DIR (sessions.ts).
+   */
+  persistPath?: string;
+  /** Set on a recruiter's own session: the identity every write runs under. */
+  userEmail?: string;
+  /** org id -> this recruiter's Ashby user id in that org. */
+  identityUserIds?: Record<string, string>;
 }
