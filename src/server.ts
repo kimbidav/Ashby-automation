@@ -119,6 +119,11 @@ function setCachedResult(data: CachedResult['data']) {
 
 // ── In-memory job store for async extraction ──────────────────────────────
 
+interface SweepCallback {
+  url: string;
+  ref: string | null;
+}
+
 interface ExtractionJob {
   id: string;
   status: 'running' | 'completed' | 'failed';
@@ -128,15 +133,84 @@ interface ExtractionJob {
   result?: CachedResult['data'];
   error?: string;
   detail?: string;
+  /** Callers to notify when the sweep finishes (Compass persists the result
+   *  server-side from this, so saving never depends on an open browser tab). */
+  callbacks?: SweepCallback[];
 }
 
 const jobs = new Map<string, ExtractionJob>();
+const CALLBACK_SECRET = process.env.EXTRACTOR_CALLBACK_SECRET || '';
+
+// A running sweep is NEVER evicted. The old rule deleted jobs 30 min after
+// they STARTED, running or not; an 84-org sweep with the archived/hired pass
+// can outlast that, so its result landed in a job nobody could read any more
+// ("the extractor lost track of this run") and the snapshot silently stayed
+// stale. Finished jobs are kept an hour after they FINISH so a late poller or
+// a retried callback can still collect the result. A sweep still "running"
+// after 6 h is a zombie (every API call has a 15 s timeout) and is dropped.
+const FINISHED_JOB_TTL_MS = 60 * 60 * 1000;
+const ZOMBIE_JOB_MS = 6 * 60 * 60 * 1000;
 
 function cleanupOldJobs() {
-  const cutoff = Date.now() - 30 * 60 * 1000;
+  const now = Date.now();
   for (const [id, job] of jobs) {
-    if (new Date(job.created_at).getTime() < cutoff) {
-      jobs.delete(id);
+    if (job.status === 'running') {
+      if (now - new Date(job.created_at).getTime() > ZOMBIE_JOB_MS) jobs.delete(id);
+      continue;
+    }
+    const finishedAt = new Date(job.completed_at ?? job.created_at).getTime();
+    if (now - finishedAt > FINISHED_JOB_TTL_MS) jobs.delete(id);
+  }
+}
+
+/** Only https callbacks (plus localhost for development). */
+function validCallbackUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol === 'https:') return u.toString();
+    if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return u.toString();
+  } catch { /* fall through */ }
+  return null;
+}
+
+function addSweepCallback(job: ExtractionJob, body: any): void {
+  const url = validCallbackUrl(body?.callback_url);
+  if (!url) return;
+  const ref = typeof body?.callback_ref === 'string' ? body.callback_ref.slice(0, 200) : null;
+  job.callbacks = job.callbacks ?? [];
+  if (!job.callbacks.some((c) => c.url === url && c.ref === ref)) job.callbacks.push({ url, ref });
+}
+
+/**
+ * Tell every registered caller the sweep finished. The payload is small (job
+ * id + status); the caller fetches the result through /api/extract/status,
+ * which keeps finished jobs for an hour. Retries with backoff because a
+ * missed callback means a stale dashboard until the next sweep.
+ */
+async function deliverSweepCallbacks(job: ExtractionJob): Promise<void> {
+  for (const cb of job.callbacks ?? []) {
+    const payload = JSON.stringify({ kind: 'sweep', job_id: job.id, callback_ref: cb.ref, status: job.status });
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 150_000);
+        const res = await fetch(cb.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...(CALLBACK_SECRET ? { 'x-extractor-callback-secret': CALLBACK_SECRET } : {}) },
+          body: payload,
+          signal: ctl.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          console.log(`[sweep ${job.id}] callback delivered (ref ${cb.ref ?? '-'})`);
+          break;
+        }
+        console.warn(`[sweep ${job.id}] callback returned ${res.status} (attempt ${attempt})`);
+      } catch (err: any) {
+        console.warn(`[sweep ${job.id}] callback failed (attempt ${attempt}): ${redactSecrets(err?.message || String(err))}`);
+      }
+      await new Promise((r) => setTimeout(r, attempt * 15_000));
     }
   }
 }
@@ -145,7 +219,7 @@ function cleanupOldJobs() {
 
 // Bump on behavior changes so a curl to /api/health confirms which build a
 // deployment (e.g. Railway) is actually running.
-const BUILD_STAMP = '2026-09-23-per-user-sessions';
+const BUILD_STAMP = '2026-09-25-sweep-callback';
 
 app.get('/api/health', async (_req: express.Request, res: express.Response) => {
   const userSessions = await listUserSessions().catch(() => []);
@@ -155,6 +229,31 @@ app.get('/api/health', async (_req: express.Request, res: express.Response) => {
     user_sessions: userSessions.length,
     user_sessions_healthy: userSessions.filter((u) => u.status === 'healthy').length,
     team_lock_holder: lockHolder(TEAM_LOCK_KEY),
+    // Sweep visibility without the shared secret: counts and timings only,
+    // never org or candidate names (this endpoint is public).
+    sweep: (() => {
+      const running = runningJobId ? jobs.get(runningJobId) : undefined;
+      const finished = [...jobs.values()].filter((j) => j.status !== 'running' && j.completed_at)
+        .sort((a, b) => (b.completed_at ?? '').localeCompare(a.completed_at ?? ''))[0];
+      return {
+        running: running?.status === 'running'
+          ? {
+              started_at: running.created_at,
+              minutes: Math.round((Date.now() - new Date(running.created_at).getTime()) / 60000),
+              orgs_done: running.progress?.completed ?? 0,
+              orgs_total: running.progress?.total ?? 0,
+              callbacks: running.callbacks?.length ?? 0,
+            }
+          : null,
+        last_finished: finished
+          ? {
+              status: finished.status,
+              completed_at: finished.completed_at,
+              minutes: Math.round((new Date(finished.completed_at!).getTime() - new Date(finished.created_at).getTime()) / 60000),
+            }
+          : null,
+      };
+    })(),
     require_user_identity: REQUIRE_USER_IDENTITY,
     timestamp: new Date().toISOString(),
     stored_cookie_configured: !!STORED_COOKIE,
@@ -1035,7 +1134,7 @@ interface UploadJob {
 }
 const uploadJobs = new Map<string, UploadJob>();
 const UPLOAD_JOB_TTL_MS = 30 * 60 * 1000;
-const CALLBACK_SECRET = process.env.EXTRACTOR_CALLBACK_SECRET || '';
+// CALLBACK_SECRET is declared near the job store (used by sweep and upload callbacks).
 
 function cleanupUploadJobs() {
   const cutoff = Date.now() - UPLOAD_JOB_TTL_MS;
@@ -1333,14 +1432,17 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     console.log('Returning cached extraction result (async fast path)');
     const jobId = crypto.randomUUID();
     // Create a pre-completed job so the status endpoint returns the result
-    jobs.set(jobId, {
+    const cachedJob: ExtractionJob = {
       id: jobId,
       status: 'completed',
       created_at: new Date().toISOString(),
       completed_at: new Date().toISOString(),
       result: { ...cached, cached: true } as any,
-    });
+    };
+    addSweepCallback(cachedJob, req.body);
+    jobs.set(jobId, cachedJob);
     res.json({ jobId, job_id: jobId, id: jobId, status: 'completed', cached: true });
+    void deliverSweepCallbacks(cachedJob);
     return;
   }
 
@@ -1348,6 +1450,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     const running = jobs.get(runningJobId);
     if (running && running.status === 'running') {
       console.log(`Attaching caller to in-flight extraction job ${running.id}`);
+      addSweepCallback(running, req.body);
       res.json({ jobId: running.id, job_id: running.id, id: running.id, status: 'running', attached: true });
       return;
     }
@@ -1369,6 +1472,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     created_at: new Date().toISOString(),
     progress: { completed: 0, total: 0, current_org: 'Starting...' },
   };
+  addSweepCallback(job, req.body);
   jobs.set(jobId, job);
   runningJobId = jobId;
 
@@ -1386,6 +1490,9 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
       job.completed_at = new Date().toISOString();
       job.result = result;
       if (runningJobId === jobId) runningJobId = null;
+      const minutes = ((Date.now() - new Date(job.created_at).getTime()) / 60000).toFixed(1);
+      console.log(`[sweep ${jobId}] completed in ${minutes} min`);
+      void deliverSweepCallbacks(job);
     })
     .catch((err: any) => {
       const message = err?.message || String(err);
@@ -1399,6 +1506,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
       }
       job.detail = message;
       console.error(`Job ${jobId} failed:`, message);
+      void deliverSweepCallbacks(job);
     });
 
   res.json({ jobId, job_id: jobId, id: jobId, status: 'running' });
@@ -1410,7 +1518,7 @@ const handleJobStatus = (req: express.Request, res: express.Response) => {
   const job = jobs.get(jobId);
 
   if (!job) {
-    res.status(404).json({ error: 'Job not found. It may have expired (30-min TTL).' });
+    res.status(404).json({ error: 'Job not found. Finished sweeps are kept for 60 minutes; the extractor may also have restarted.' });
     return;
   }
 
