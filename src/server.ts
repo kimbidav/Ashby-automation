@@ -219,7 +219,7 @@ async function deliverSweepCallbacks(job: ExtractionJob): Promise<void> {
 
 // Bump on behavior changes so a curl to /api/health confirms which build a
 // deployment (e.g. Railway) is actually running.
-const BUILD_STAMP = '2026-09-25-sweep-callback';
+const BUILD_STAMP = '2026-10-14-probe-confirm-or-skip';
 
 app.get('/api/health', async (_req: express.Request, res: express.Response) => {
   const userSessions = await listUserSessions().catch(() => []);
@@ -227,6 +227,7 @@ app.get('/api/health', async (_req: express.Request, res: express.Response) => {
     status: 'ok',
     build: BUILD_STAMP,
     user_sessions: userSessions.length,
+    user_sessions_expired: userSessions.filter((u) => u.status === 'expired').length,
     user_sessions_healthy: userSessions.filter((u) => u.status === 'healthy').length,
     team_lock_holder: lockHolder(TEAM_LOCK_KEY),
     // Sweep visibility without the shared secret: counts and timings only,
@@ -1328,7 +1329,14 @@ async function seedUserSession(userEmail: string, cookie: string, res: express.R
 }
 
 /** Probe one recruiter's stored login: one CSRF GET, rotation persisted. */
-async function probeUserSession(email: string): Promise<{ authenticated: boolean; reason?: string }> {
+/**
+ * Is this recruiter's Ashby login still good? Confirm-or-skip: a login is
+ * marked expired only when Ashby itself refuses it (401 / expired / CSRF).
+ * A timeout, a network blip or an Ashby 5xx is "couldn't check" — the stored
+ * status is kept and the caller gets reason "probe_error", so a transient
+ * failure never tells a recruiter to reconnect for nothing.
+ */
+async function probeUserSession(email: string): Promise<{ authenticated: boolean; reason?: string; detail?: string }> {
   const session = await loadUserSession(email);
   if (!session) return { authenticated: false, reason: 'no_session' };
   session.onCookiesRotated = (s) => { void persistSessionCookies(s); };
@@ -1337,8 +1345,14 @@ async function probeUserSession(email: string): Promise<{ authenticated: boolean
     await updateUserSessionFile(email, { status: 'healthy', lastOkAt: new Date().toISOString(), lastError: undefined });
     return { authenticated: true };
   } catch (err: any) {
-    await updateUserSessionFile(email, { status: 'expired', lastError: redactSecrets(err?.message || String(err)).slice(0, 200) });
-    return { authenticated: false, reason: 'expired' };
+    const message = redactSecrets(err?.message || String(err)).slice(0, 200);
+    if (isSessionAuthFailure(message)) {
+      await updateUserSessionFile(email, { status: 'expired', lastError: message });
+      return { authenticated: false, reason: 'expired', detail: message };
+    }
+    await updateUserSessionFile(email, { lastError: `probe_error: ${message}` });
+    console.warn(`[user-session] probe for ${email} could not reach Ashby (status kept): ${message}`);
+    return { authenticated: false, reason: 'probe_error', detail: message };
   }
 }
 
