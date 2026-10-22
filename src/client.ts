@@ -986,7 +986,6 @@ export async function fetchPipelineForOrg(
         customRequisitionId
         confidential
         userFollowsOrHasRole
-        applicationCount
         __typename
       }
       result: applicationsByPrebuiltView(
@@ -1147,13 +1146,34 @@ ${applicationFieldsFragment}
   };
 
   try {
-    const initialData = await graphqlQuery<InitialFetchResponse>(
-      session,
-      'InitialFetch',
-      initialQuery,
-      initialVars,
-      switchedOrg
-    );
+    // Same slow first-query-after-org-switch as fetchOpenJobs: for big orgs
+    // (Valon Tech, Owner.com, EliseAI, Prelim, Nooks, January, LangChain) it
+    // outran 15s on every sweep from ~2026-08-20, the org was dropped from the
+    // trusted set, and the backend's org-health banner reported it as "no
+    // longer readable" while DK still had access. `applicationCount` (the
+    // known ~90s field) is no longer requested; 45s + two retries covers the rest.
+    let initialData: InitialFetchResponse | undefined;
+    requestTimeoutOverride = 45_000;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          initialData = await graphqlQuery<InitialFetchResponse>(
+            session,
+            'InitialFetch',
+            initialQuery,
+            initialVars,
+            switchedOrg || attempt > 1
+          );
+          break;
+        } catch (err: any) {
+          if (!isTimeoutError(err) || attempt >= 3) throw err;
+          console.warn(`  InitialFetch timed out for org ${orgName || orgId}, retrying (${attempt}/2)...`);
+        }
+      }
+    } finally {
+      requestTimeoutOverride = null;
+    }
+    if (!initialData) throw new Error('InitialFetch returned no data');
 
     jobsData = { jobsPipelines: initialData.jobsPipelines };
     console.log(`Found ${jobsData.jobsPipelines.length} open jobs`);
@@ -1193,7 +1213,6 @@ ${applicationFieldsFragment}
             customRequisitionId
             confidential
             userFollowsOrHasRole
-            applicationCount
             __typename
           }
           result: applicationsByPrebuiltView(

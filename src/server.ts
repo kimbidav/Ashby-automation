@@ -541,15 +541,45 @@ async function clearStaleSingletonLocks(profileDir: string): Promise<void> {
 
 app.post('/api/auth/start', async (_req: express.Request, res: express.Response) => {
   if (liveContext) {
-    // Already up. Return current status instead of double-launching.
-    const probe = await probeLiveAuth(liveContext);
-    res.json({
-      already_running: true,
-      authenticated: probe.ok,
-      reason: probe.reason,
-      started_at: liveContextStartedAt,
-    });
-    return;
+    // Already up. Return current status instead of double-launching —
+    // unless the user closed the window. Cmd-W on the last tab leaves the
+    // Chromium process (and this context) alive with ZERO pages, so 'close'
+    // never fires and "already running" means "nothing on screen". Seen
+    // 2026-10-13: the dashboard sat at "Waiting for Chromium login…" for two
+    // hours with no window to sign into, every fetch fell back to the older
+    // persisted login, and a client added that day (Longitude Labs) stayed
+    // `unknown_org`. Reopen the sign-in page in the same context; if the
+    // context turns out to be dead, drop it and launch fresh below.
+    let reopened = false;
+    if (liveContext.pages().length === 0) {
+      const ctx = liveContext;
+      try {
+        const page = await ctx.newPage();
+        await page.goto('https://app.ashbyhq.com/signin', { waitUntil: 'domcontentloaded' }).catch((err) => {
+          console.warn('[live-auth] reopen navigation warning:', err?.message);
+        });
+        reopened = true;
+        console.log('[live-auth] login window had been closed; reopened the sign-in page.');
+      } catch (err: any) {
+        console.warn(`[live-auth] could not reopen a page in the live context (${err?.message}); relaunching.`);
+        liveContext = null;
+        liveContextStartedAt = null;
+        await ctx.close().catch(() => {});
+      }
+    }
+    const ctx = liveContext;
+    if (ctx) {
+      const probe = await probeLiveAuth(ctx);
+      res.json({
+        already_running: true,
+        reopened,
+        window_open: ctx.pages().length > 0,
+        authenticated: probe.ok,
+        reason: probe.reason,
+        started_at: liveContextStartedAt,
+      });
+      return;
+    }
   }
 
   try {
@@ -663,6 +693,8 @@ app.get('/api/auth/status', async (_req: express.Request, res: express.Response)
   const probe = await probeLiveAuth(liveContext);
   res.json({
     live_active: true,
+    // false = the user closed the window; POST /api/auth/start reopens it.
+    window_open: liveContext.pages().length > 0,
     authenticated: probe.ok,
     reason: probe.reason,
     started_at: liveContextStartedAt,
