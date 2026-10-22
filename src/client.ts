@@ -1341,13 +1341,32 @@ ${applicationFieldsFragment}
       `;
 
       try {
-        const fallbackData = await graphqlQuery<InitialFetchResponse>(
-          session,
-          'InitialFetch',
-          fallbackInitialQuery,
-          initialVars,
-          !leanRequested // error path: force a CSRF refresh; lean-by-request: the switch just did
-        );
+        // Same 45s + two retries as the full query: the lean shape is
+        // cheaper but a cold org can still outrun 15s (EliseAI aborted on
+        // the first scoped sweep, 2026-10-22), and an abort here used to fail
+        // the org outright.
+        let fallbackData: InitialFetchResponse | undefined;
+        requestTimeoutOverride = 45_000;
+        try {
+          for (let attempt = 1; ; attempt++) {
+            try {
+              fallbackData = await graphqlQuery<InitialFetchResponse>(
+                session,
+                'InitialFetch',
+                fallbackInitialQuery,
+                initialVars,
+                (!leanRequested && attempt === 1) || attempt > 1 // error path: force a CSRF refresh; lean-by-request: the switch just did
+              );
+              break;
+            } catch (err: any) {
+              if (!isTimeoutError(err) || attempt >= 3) throw err;
+              console.warn(`  InitialFetch (lean) timed out for org ${orgName || orgId}, retrying (${attempt}/2)...`);
+            }
+          }
+        } finally {
+          requestTimeoutOverride = null;
+        }
+        if (!fallbackData) throw new Error('InitialFetch (lean) returned no data');
 
         jobsData = { jobsPipelines: fallbackData.jobsPipelines };
         console.log(`  Found ${jobsData.jobsPipelines.length} open jobs (fallback)`);

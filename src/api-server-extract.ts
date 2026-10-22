@@ -665,7 +665,12 @@ export async function extractPipeline(
           // by definition: zero events is their normal state, not missing
           // data. They were ~320 of 701 targets on 2026-10-22 and burned the
           // whole 180s floor every run. A suspect STATUS above still wins.
-          return c.sweptFrom !== 'ApplicationReview';
+          if (c.sweptFrom === 'ApplicationReview') return false;
+          // A lean sweep never carries events, so "no events" says nothing
+          // about the row; re-fetching every active row would cost ~1s each
+          // (the coordinator keeps the last full sweep's events on file).
+          // Suspect statuses (scheduled, waiting on…) above still qualify.
+          return !leanInitialFetch;
         }
         return c.needsScheduling === true;
       };

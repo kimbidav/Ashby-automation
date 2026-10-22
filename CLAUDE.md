@@ -381,8 +381,11 @@ Both `POST /api/extract` and `POST /api/extract/start` accept, besides `force`:
   coordinator's merge treats empty/zero as "no information" and unions
   interview events, so rows that the targeted enrichment pass does not
   re-fetch keep the detail from the last full sweep. In lean mode every
-  active row has zero events, so `enrich_credited_to` is what keeps the pass
-  to the recruiter in scope.
+  active row has zero events, so that rule is switched off for the pass:
+  only suspect statuses (scheduled, waiting on…) and `needs_scheduling`
+  qualify, and `enrich_credited_to` keeps it to the recruiter in scope. The
+  lean query gets the same 45s timeout + two retries as the full one (a cold
+  org can still outrun 15s — EliseAI aborted on the first scoped sweep).
 - `extraction_stats` says what happened: `scope: "full" | "partial"`,
   `orgs_requested`, `requested_org_names` (partial only), `unseen_orgs`,
   `unmatched_scope_entries`, `done_sweep`, `initial_fetch`, plus the timing fields
