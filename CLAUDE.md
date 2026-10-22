@@ -26,9 +26,19 @@ server.ts (Express API)
 
 1. **Load session** from `.ashby-session.json` (cookie map with `ashby_session_token`)
 2. **Discover orgs** via `GET /api/auth/available_identities` → list of `{orgId, userId}`
-3. **For each org** (sequential — server-side session constraint):
-   a. `POST /api/auth/change_user/{userId}` to switch org context
-   b. `GET /api/csrf/token` to refresh CSRF token (required after every switch)
+3. **For each org** (sequential — server-side session constraint). The sweep
+   loop in `extractPipeline` owns **one** switch per org and passes
+   `alreadyInOrg: true` to everything it calls under it (pipeline fetch,
+   done-sweep, restricted probes). Until 2026-10-22 each org paid two
+   `change_user` and six CSRF round-trips — `fetchPipelineForOrg` switched
+   and refreshed, forced a second refresh before `InitialFetch`, then
+   `fetchArchivedForOrg` switched again and forced a refresh on page 0 of
+   each of its three views. `switchOrgContext` already refreshes the
+   identity-scoped token eagerly, so all of those were duplicates.
+   a. `POST /api/auth/change_user/{userId}` to switch org context (returns an
+      identity verdict; `mismatch` fails the org instead of sweeping wherever
+      the session landed)
+   b. `GET /api/csrf/token` — done inside `switchOrgContext`, once per switch
    c. **Single combined GraphQL request** (`InitialFetch`) fetches:
       - All open jobs (`jobsPipelines`)
       - First page of active applications with full enrichment data
@@ -52,7 +62,23 @@ Most enrichment arrives inline: the `applicationsByPrebuiltView` query includes 
 
 This data is extracted during `normalizePipelineData()` in `client.ts`.
 
-On top of that, `extractPipeline()` runs a **targeted enrichment pass** (`enrichCandidatesWithDetails()` in `client.ts`) for suspect candidates — status "Scheduled"/"Waiting on…", or active candidates whose bulk row has zero interview events (the bulk view lags newly-moved stages). It re-fetches full application details per candidate, time-boxed by `ASHBY_ENRICH_MIN_BUDGET_SEC` (default 180s; raise for a one-off catch-up). In legacy cookie mode it runs sequentially (one token in flight — see Session Management); in live-browser mode it runs 5-wide. Candidates left unenriched when the deadline hits keep their bulk data and are picked up by future runs (the dashboard backend merges per candidate, so enrichment accumulates).
+On top of that, `extractPipeline()` runs a **targeted enrichment pass** (`enrichCandidatesWithDetails()` in `client.ts`) for suspect candidates — status "Scheduled"/"Waiting on…", or active candidates whose bulk row has zero interview events (the bulk view lags newly-moved stages). It re-fetches full application details per candidate, time-boxed by `ASHBY_ENRICH_MIN_BUDGET_SEC` (default 180s; raise for a one-off catch-up). In legacy cookie mode it runs sequentially (one token in flight — see Session Management); in live-browser mode it runs 5-wide. Candidates left unenriched when the deadline hits keep their bulk data; the dashboard backend merges per candidate, so what *was* enriched sticks.
+
+**Who gets enriched, in what order (2026-10-22).** The pass has no memory
+between runs, so order decides who the 180s floor ever reaches. Two rules:
+- Rows the done-sweep pulled from the `ApplicationReview` view (`sweptFrom`)
+  are pre-interview by definition — zero events is their normal state, not
+  missing data — so they do **not** trip the "stage set, no events" rule. They
+  were ~320 of 701 targets and burned the whole floor every run. A suspect
+  *status* on such a row still qualifies it.
+- Orgs with targets credited to the recruiters in
+  `ASHBY_RESTRICTED_PROBE_CREDITED_TO` (DK by default) go first, most such
+  targets first, then by newest activity; inside an org those targets go
+  first too. Before this the pass walked orgs alphabetically and the deadline
+  cut off around the same letter every run, so late-alphabet orgs were never
+  enriched and early ones were redone each time. A request's
+  `enrich_credited_to` narrows the pass to those recruiters' rows only
+  (recruiter-scoped quick sweeps).
 
 ### Error Recovery: Retry + Fallback
 
@@ -320,10 +346,55 @@ The API server returns candidates in snake_case with computed interview summary 
 
 The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `CandidateTable.tsx` renders `current_stage_interviews` and `interview_history_summary` in expandable row details.
 
+## Scoped Sweeps (`scope`, `done_sweep`, `enrich_credited_to`)
+
+Both `POST /api/extract` and `POST /api/extract/start` accept, besides `force`:
+
+```json
+{ "scope": { "org_ids": ["…"], "org_names": ["Deeptune"], "known_org_ids": ["…"], "include_unknown": true },
+  "done_sweep": "full",
+  "enrich_credited_to": ["david kimball", "david", "dk"] }
+```
+
+- `resolveSweepScope` (pure, `sweep-scope.test.ts`) picks orgs in request order:
+  `org_ids`, then `org_names` (case- and space-insensitive, so "Deeptune" ≡
+  "Deep Tune"), then — with `include_unknown` — every org on the account whose
+  id is not in `known_org_ids`, so a client that added the recruiter since the
+  caller's last full sweep is always picked up. No/empty scope = full sweep.
+- `done_sweep: "live_only"` reads only the `ApplicationReview` view (those are
+  LIVE pre-interview rows the Active view never returns) and skips Archived,
+  Hired and the restricted probes. The caller must then **not** infer archival
+  from absence: without the Archived view + probe, a candidate archived on a
+  visible job while live on a no-access job (the Charles Lin case) looks
+  exactly like one who left. The coordinator's quick sweep therefore keeps
+  `done_sweep: "full"`.
+- `extraction_stats` says what happened: `scope: "full" | "partial"`,
+  `orgs_requested`, `requested_org_names` (partial only), `unseen_orgs`,
+  `unmatched_scope_entries`, `done_sweep`, plus the Phase-0 timing fields
+  `org_seconds` and `request_timing`. `orgs_total` stays the account's identity
+  count; `orgs_fetched` / `orgs_failed` / `failed_org_names` are relative to the
+  requested set. **A partial result is never put in the 10-minute result
+  cache** (callers of the cache expect the whole account) and may legitimately
+  contain zero candidates. Running/attached job status includes the job's
+  `scope` so a full-sweep caller can see it attached to a scoped job.
+
+## Timing Lines (where did the sweep's time go?)
+
+The log has no timestamps, so `doFetch` records every request's elapsed time
+by operation (GraphQL `op=` name, else the URL's last path segment) and the
+sweep prints, per org, `[Org] 14.2s — InitialFetch 9.8s, ArchivedSweep 3.1s
+(3), token 0.6s (6), change_user 0.5s (2)`, plus an enrichment split and a
+run total; the same numbers are in `extraction_stats.org_seconds` /
+`request_timing`. `ASHBY_TRACE_REQUESTS=1` logs every single request. First
+measured split (2026-10-22, before the one-switch change): `InitialFetch`
+dominates — 8–20s on mid-size orgs even with one application (Agave: 1 job,
+1 application, 15s), ~1s on small ones; the three `ArchivedSweep` page-0
+calls cost 2–6s; switches, CSRF and probes are ~0.2–0.5s each.
+
 ## Common Pitfalls
 
 - **Session rotation**: `doFetch` mirrors every `Set-Cookie` into `session.cookies` in-place and (when the persistence hook is attached) immediately rewrites `.ashby-session.json`. A crash mid-extraction leaves the file holding the newest rotated token, so the next run resumes off a valid session.
-- **CSRF tokens**: Must be refreshed after every org switch. The token from before the switch is invalid for the new org context.
+- **CSRF tokens**: Must be refreshed after every org switch — and `switchOrgContext` does exactly that, once. Don't add `forceRefreshCsrf` to queries that run right after a switch; each one is a wasted round-trip (that was 4 per org). The 403→refresh retry in `graphqlQuery` is the safety net for a token that goes stale mid-org.
 - **`applicationsByPrebuiltView` fields**: This is an internal Ashby API. If Ashby changes the schema, the expanded query may fail. The fields we request (interviewEvents, interviewPlan, scorecardSubmission) are stable since they're used by the Ashby web UI itself.
 - **Transient server errors**: Ashby's API returns `"Unidentified server error"` for some orgs when the full enrichment query is too heavy. This is NOT a session/auth issue — it's server-side. The retry + fallback mechanism in `graphqlQuery()` and `fetchPipelineForOrg()` handles this automatically. Orgs with large datasets (many candidates/interviews) are most likely to trigger it.
 - **ESM modules**: Project uses `"type": "module"` with `ts-node/esm` loader. All imports use `.js` extensions even for `.ts` files.
@@ -331,9 +402,25 @@ The Lovable frontend repo is at https://github.com/kimbidav/ashbypipeline. Its `
 
 ## Future Performance Optimizations
 
-Currently the extraction processes all ~70 orgs sequentially (~2 min on a good day; ~10–15 min observed when Ashby is slow and per-request 15s timeouts trigger retries). Parallelization is blocked by Ashby's server-side session (one org context at a time per token). Planned improvements:
+A full sweep of 88 orgs took 25–40 min in October 2026 (1372–2344s over ten
+runs), ~15s per org, before the one-switch-per-org change. Parallelization is
+blocked by Ashby's server-side, per-USER org context (one org at a time per
+login — a second session token does not help, the context belongs to the
+user). The internal GraphQL path is feature-frozen (Ashby's 2026-08-25
+email): reuse existing query shapes, add no new fields/arguments. What's left:
 
-- **Lazy enrichment**: Serve simple query results immediately, fetch scorecard/feedback on-demand per candidate via the existing `ApiApplication` query in `fetchApplicationDetails()`
-- **Skip empty orgs**: Check `jobsPipelines.applicationCount` first, skip orgs with 0 candidates (~20 orgs currently)
-- **Cache + incremental refresh**: Store last extraction, serve cached data instantly, only re-fetch orgs whose `applicationCount` changed
-- **Streaming responses**: Use SSE or chunked JSON to stream results per-org as they complete
+- **Scoped sweeps** (done): the coordinator sweeps the recruiter's ~40 orgs on
+  demand and the whole account nightly.
+- **`InitialFetch` is the floor**: 8–20s on mid-size orgs regardless of how
+  many active applications they have. Whether that is the scorecard-laden
+  query shape (the lean `fallbackApplicationFields` query is already a used
+  shape) or a per-switch server-side warm-up is the next thing to measure.
+- **Done-sweep page 0 as one document**: the three `ArchivedSweep` calls could
+  be three aliased `applicationsByPrebuiltView` fields in one request (the
+  shape `InitialFetch` already uses) if the measured cost is per round-trip.
+- **Skip empty orgs / incremental refresh**: needs a cross-org change signal
+  that doesn't itself require a switch; none known on the frozen path. The
+  `orgCache` in `api-server-extract.ts` is declared but never written.
+- **Public API** (`public-api-stage0` branch, parked): per-org keys, no
+  org context, orgs in parallel and `syncToken` incremental sync — the only
+  route below a few minutes. Blocked on marketplace keys, none issued yet.

@@ -876,6 +876,11 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   return Array.from(orgMap.values());
 }
 
+/** Thrown internally to route a `lean` request down the existing fallback path. */
+class LeanInitialFetchRequested extends Error {
+  constructor() { super('lean InitialFetch requested'); }
+}
+
 export async function fetchPipelineForOrg(
   session: AshbySession,
   orgId: string,
@@ -885,7 +890,14 @@ export async function fetchPipelineForOrg(
   // is where the sweep used to read the org name mid-query; the caller already
   // has it, so we thread it in instead. See the sessionUserV2 removal below.
   orgNameHint?: string,
-  options: { alreadyInOrg?: boolean } = {},
+  options: {
+    alreadyInOrg?: boolean;
+    /** Use the lean InitialFetch (no interviewEvents/scorecards) from the
+     *  start — the same query the transient-error fallback already uses, so
+     *  no new shape. For scoped sweeps whose caller keeps existing enrichment
+     *  per row and re-fetches the suspect ones. */
+    lean?: boolean;
+  } = {},
 ): Promise<PipelineFetchResult> {
   // Switch to the org context first — unless the caller (the sweep loop)
   // already did. The sweep used to pay this change_user + CSRF round-trip
@@ -1233,6 +1245,7 @@ ${applicationFieldsFragment}
   };
 
   try {
+    if (options.lean) throw new LeanInitialFetchRequested();
     // Same slow first-query-after-org-switch as fetchOpenJobs: for big orgs
     // (Valon Tech, Owner.com, EliseAI, Prelim, Nooks, January, LangChain) it
     // outran 15s on every sweep from ~2026-08-20, the org was dropped from the
@@ -1272,10 +1285,14 @@ ${applicationFieldsFragment}
   } catch (error: any) {
     // If the full query fails (even after retries in graphqlQuery), try a fallback
     // with stripped-down fields (no scorecard data which can cause server errors)
-    const isServerError = error?.message?.includes('Unidentified server error') ||
+    const leanRequested = error instanceof LeanInitialFetchRequested;
+    const isServerError = leanRequested ||
+                          error?.message?.includes('Unidentified server error') ||
                           error?.message?.includes('looking into it');
     if (isServerError) {
-      console.warn(`  ⚠️  Full query failed for org ${orgId}, retrying with simplified query (no scorecard data)...`);
+      if (!leanRequested) {
+        console.warn(`  ⚠️  Full query failed for org ${orgId}, retrying with simplified query (no scorecard data)...`);
+      }
       useFallbackQuery = true;
 
       const fallbackInitialQuery = `
@@ -1329,7 +1346,7 @@ ${applicationFieldsFragment}
           'InitialFetch',
           fallbackInitialQuery,
           initialVars,
-          true // force CSRF refresh
+          !leanRequested // error path: force a CSRF refresh; lean-by-request: the switch just did
         );
 
         jobsData = { jobsPipelines: fallbackData.jobsPipelines };
