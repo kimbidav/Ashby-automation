@@ -7,7 +7,8 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg, fetchCandidateRestrictedSummaries, resetRequestTimings, snapshotRequestTimings, diffRequestTimings, formatRequestTimings } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg, fetchCandidateRestrictedSummaries, switchOrgContext, resetRequestTimings, snapshotRequestTimings, diffRequestTimings, formatRequestTimings } from './client.js';
+import type { DoneSweepView } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -177,6 +178,83 @@ export function createSessionFromCookie(cookieHeader: string): AshbySession {
  */
 export type ProgressCallback = (completed: number, total: number, currentOrg: string) => void;
 
+/** Which orgs a sweep covers. Absent = every org on the account (a full sweep). */
+export interface SweepScope {
+  /** Ashby org ids to sweep, in this order. */
+  org_ids?: string[];
+  /** Org display names (case/space-insensitive) — fallback for rows that
+   *  predate org_id. Matched after org_ids, in this order. */
+  org_names?: string[];
+  /** Org ids the caller already has on file. With include_unknown, any org on
+   *  the account that is NOT in this list is added to the sweep — a client
+   *  that added the recruiter since the last full sweep is always picked up. */
+  known_org_ids?: string[];
+  include_unknown?: boolean;
+}
+
+export interface ExtractOptions {
+  scope?: SweepScope;
+  /** 'full' (default): Archived + Hired + ApplicationReview views and the
+   *  restricted-application probes. 'live_only': only the ApplicationReview
+   *  view (live pre-interview rows); the caller must then NOT infer archival
+   *  from absence, since a candidate archived at an org they're otherwise
+   *  live at (no-access job) can't be told apart from one who left. */
+  doneSweep?: 'full' | 'live_only';
+  /** Only enrich targets credited to these recruiters (default: everyone,
+   *  priority order from ASHBY_RESTRICTED_PROBE_CREDITED_TO). */
+  enrichCreditedTo?: string[];
+}
+
+export interface OrgIdentity { id: string; name: string; userId: string }
+
+const normOrgName = (name: string | undefined | null) => (name || '').trim().toLowerCase();
+const compactOrgName = (name: string | undefined | null) => normOrgName(name).replace(/[^a-z0-9]/g, '');
+
+/**
+ * Pick the orgs a sweep visits, in request order: org_ids, then org_names
+ * (exact normalized, then space/punctuation-insensitive — "Deep Tune" ≡
+ * "Deeptune"), then — with include_unknown — every org on the account that
+ * the caller has never seen. No scope = every org (full). Pure; unit-tested.
+ */
+export function resolveSweepScope<T extends OrgIdentity>(
+  identities: T[],
+  scope?: SweepScope,
+): { selected: T[]; unseen: T[]; partial: boolean; unmatched: string[] } {
+  if (!scope || (!scope.org_ids?.length && !scope.org_names?.length && !scope.include_unknown)) {
+    return { selected: identities, unseen: [], partial: false, unmatched: [] };
+  }
+  const byId = new Map(identities.map((o) => [o.id, o]));
+  const byName = new Map<string, T>();
+  const byCompact = new Map<string, T>();
+  for (const o of identities) {
+    if (normOrgName(o.name) && !byName.has(normOrgName(o.name))) byName.set(normOrgName(o.name), o);
+    if (compactOrgName(o.name) && !byCompact.has(compactOrgName(o.name))) byCompact.set(compactOrgName(o.name), o);
+  }
+  const selected: T[] = [];
+  const picked = new Set<string>();
+  const unmatched: string[] = [];
+  const take = (o: T | undefined, label: string) => {
+    if (!o) { unmatched.push(label); return; }
+    if (picked.has(o.id)) return;
+    picked.add(o.id);
+    selected.push(o);
+  };
+  for (const id of scope.org_ids || []) take(byId.get(id), id);
+  for (const name of scope.org_names || []) take(byName.get(normOrgName(name)) ?? byCompact.get(compactOrgName(name)), name);
+  const unseen: T[] = [];
+  if (scope.include_unknown) {
+    const known = new Set(scope.known_org_ids || []);
+    for (const o of identities) {
+      if (!known.has(o.id) && !picked.has(o.id)) {
+        picked.add(o.id);
+        selected.push(o);
+        unseen.push(o);
+      }
+    }
+  }
+  return { selected, unseen, partial: true, unmatched };
+}
+
 // ── Per-org result cache (persists across requests in Railway's process) ──
 
 interface OrgCacheEntry {
@@ -218,6 +296,14 @@ const ARCHIVED_LOOKBACK_DAYS = parseInt(process.env.ASHBY_ARCHIVED_LOOKBACK_DAYS
 const RESTRICTED_PROBE_CREDITED_TO = (process.env.ASHBY_RESTRICTED_PROBE_CREDITED_TO ?? 'david kimball,david,dk').trim().toLowerCase();
 const RESTRICTED_PROBE_MAX_PER_ORG = parseInt(process.env.ASHBY_RESTRICTED_PROBE_MAX_PER_ORG || '25', 10);
 
+/** The probe allowlist as plain names ([] when probing is off or '*'). Also
+ *  the enrichment pass's priority list: these recruiters' candidates are
+ *  enriched before anyone else's. */
+function creditedToAllowlist(): string[] {
+  if (!RESTRICTED_PROBE_CREDITED_TO || ['0', 'off', 'false', 'no', '*'].includes(RESTRICTED_PROBE_CREDITED_TO)) return [];
+  return RESTRICTED_PROBE_CREDITED_TO.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 function shouldProbeRestricted(creditedTo: string | null): boolean {
   if (!RESTRICTED_PROBE_CREDITED_TO || ['0', 'off', 'false', 'no'].includes(RESTRICTED_PROBE_CREDITED_TO)) return false;
   if (RESTRICTED_PROBE_CREDITED_TO === '*') return true;
@@ -248,12 +334,15 @@ export async function sweepDoneRowsForOrg(
   session: AshbySession,
   orgInfo: { id: string; name: string; userId: string },
   activeCandidates: Candidate[],
+  options: { alreadyInOrg?: boolean; views?: DoneSweepView[] } = {},
 ): Promise<Candidate[]> {
   if (!INCLUDE_ARCHIVED) return [];
   let done: Candidate[];
   try {
     done = await fetchArchivedForOrg(session, orgInfo.id, orgInfo.userId, orgInfo.name, {
       sinceDays: ARCHIVED_LOOKBACK_DAYS,
+      alreadyInOrg: options.alreadyInOrg,
+      views: options.views,
     });
   } catch (err: any) {
     console.warn(`  [${orgInfo.name}] archived-sweep failed (non-fatal): ${err?.message?.substring(0, 120)}`);
@@ -363,6 +452,7 @@ export function clearOrgCache() {
 export async function extractPipeline(
   session: AshbySession,
   onProgress?: ProgressCallback,
+  options: ExtractOptions = {},
 ): Promise<ExtractResult & { extraction_stats: Record<string, unknown> }> {
   const startTime = Date.now();
 
@@ -372,12 +462,27 @@ export async function extractPipeline(
     throw new Error('No organizations found. Check your session cookie.');
   }
 
-  const orgsWithUserId = orgInfos.filter(o => o.userId);
+  // Every org the session can reach. The sweep visits `orgsWithUserId`, which
+  // is all of them (full) or the requested scope (partial).
+  const identities = orgInfos.filter(o => o.userId);
   // Remember the first org so we can restore context after extraction.
   // change_user modifies USER-LEVEL state (not per-session), so without
   // restoration the user's browser ends up in the last org we visited.
-  const firstOrg = orgsWithUserId[0];
-  console.log(`Found ${orgInfos.length} org(s) (${orgsWithUserId.length} with userId). Will restore to ${firstOrg?.name || '?'} after extraction.`);
+  const firstOrg = identities[0];
+  const scopeResolution = resolveSweepScope(identities, options.scope);
+  const orgsWithUserId = scopeResolution.selected;
+  const doneSweepMode: 'full' | 'live_only' = options.doneSweep === 'live_only' ? 'live_only' : 'full';
+  const doneSweepViews: DoneSweepView[] | undefined = doneSweepMode === 'live_only' ? ['ApplicationReview'] : undefined;
+  console.log(
+    `Found ${orgInfos.length} org(s) (${identities.length} with userId). ` +
+    (scopeResolution.partial
+      ? `Scoped sweep: ${orgsWithUserId.length} requested` +
+        (scopeResolution.unseen.length ? ` + ${scopeResolution.unseen.length} never-seen org(s) (${scopeResolution.unseen.map((o) => o.name).join(', ')})` : '') +
+        (scopeResolution.unmatched.length ? `; ${scopeResolution.unmatched.length} requested org(s) not on this account` : '') +
+        `; done-sweep ${doneSweepMode}. `
+      : '') +
+    `Will restore to ${firstOrg?.name || '?'} after extraction.`,
+  );
   onProgress?.(0, orgsWithUserId.length, 'Starting extraction...');
 
   const allCompanies: Company[] = [];
@@ -409,8 +514,9 @@ export async function extractPipeline(
   const sweepDoneForOrg = async (
     orgInfo: (typeof orgsWithUserId)[number],
     activeCandidates: Candidate[],
+    opts: { alreadyInOrg?: boolean } = {},
   ) => {
-    const rows = await sweepDoneRowsForOrg(session, orgInfo, activeCandidates);
+    const rows = await sweepDoneRowsForOrg(session, orgInfo, activeCandidates, { ...opts, views: doneSweepViews });
     if (rows.length) allCandidates.push(...rows);
   };
 
@@ -427,11 +533,20 @@ export async function extractPipeline(
     const timingsBefore = snapshotRequestTimings();
 
     try {
+      // ONE org switch per org, owned here: the pipeline fetch, the done-sweep
+      // and the restricted probes all run under it. A `mismatch` verdict
+      // (change_user answered with another identity) fails the org rather
+      // than sweeping whichever org the session actually landed in.
+      const verdict = await switchOrgContext(session, orgInfo.userId, orgInfo.id);
+      if (verdict === 'mismatch') {
+        throw new Error(`identity_mismatch: change_user did not land in ${orgInfo.name}`);
+      }
       const { companies, jobs, candidates } = await fetchPipelineForOrg(
         session,
         orgInfo.id,
         orgInfo.userId,
-        orgInfo.name
+        orgInfo.name,
+        { alreadyInOrg: true },
       );
       allCompanies.push(...companies);
       allJobs.push(...jobs);
@@ -439,7 +554,7 @@ export async function extractPipeline(
       openJobsByOrg.push(orgOpenJobs(orgInfo, jobs));
       if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
-      await sweepDoneForOrg(orgInfo, candidates);
+      await sweepDoneForOrg(orgInfo, candidates, { alreadyInOrg: true });
       const orgElapsedMs = Date.now() - orgStartedAt;
       orgSeconds[orgInfo.name] = Math.round(orgElapsedMs / 100) / 10;
       console.log(`  [${orgInfo.name}] ${(orgElapsedMs / 1000).toFixed(1)}s — ${formatRequestTimings(diffRequestTimings(timingsBefore, snapshotRequestTimings()))}`);
@@ -535,7 +650,11 @@ export async function extractPipeline(
         // Catch records where bulk fetch returned zero events but the
         // candidate looks active — likely missing data.
         if (c.stageType && !(c.interviewEvents && c.interviewEvents.length)) {
-          return true;
+          // Rows from the done-sweep's ApplicationReview view are pre-interview
+          // by definition: zero events is their normal state, not missing
+          // data. They were ~320 of 701 targets on 2026-10-22 and burned the
+          // whole 180s floor every run. A suspect STATUS above still wins.
+          return c.sweptFrom !== 'ApplicationReview';
         }
         return c.needsScheduling === true;
       };
@@ -551,8 +670,14 @@ export async function extractPipeline(
         allCandidates = await enrichCandidatesWithDetails(
           session,
           allCandidates,
-          orgsWithUserId,
-          { maxConcurrent: enrichConcurrency, shouldEnrich, deadlineMs: budgetForEnrich },
+          identities,
+          {
+            maxConcurrent: enrichConcurrency,
+            shouldEnrich,
+            deadlineMs: budgetForEnrich,
+            priorityCreditedTo: creditedToAllowlist(),
+            restrictCreditedTo: options.enrichCreditedTo,
+          },
         );
         console.log(`  Enrichment request split: ${formatRequestTimings(diffRequestTimings(enrichTimingsBefore, snapshotRequestTimings()))}`);
       } catch (err: any) {
@@ -568,7 +693,9 @@ export async function extractPipeline(
   if (firstOrg?.userId) {
     try {
       onProgress?.(orgsWithUserId.length, orgsWithUserId.length, `Restoring context to ${firstOrg.name}...`);
-      await fetchPipelineForOrg(session, firstOrg.id, firstOrg.userId, firstOrg.name);
+      // A bare switch (change_user + CSRF) — this used to re-run a whole
+      // fetchPipelineForOrg on the first org just to land there.
+      await switchOrgContext(session, firstOrg.userId, firstOrg.id);
       console.log(`✓ Restored org context to ${firstOrg.name}`);
     } catch (err: any) {
       console.warn(`⚠️  Could not restore org context: ${err?.message?.substring(0, 100)}`);
@@ -580,7 +707,9 @@ export async function extractPipeline(
   console.log(`Extraction complete in ${totalElapsed}s: ${allCandidates.length} candidates from ${orgsFetched}/${orgsWithUserId.length} orgs`);
   console.log(`  Request split for the run: ${formatRequestTimings(snapshotRequestTimings())}`);
 
-  if (allCandidates.length === 0) {
+  // A scoped sweep can legitimately come back empty (a handful of orgs with
+  // nothing live); a FULL sweep with nothing at all means the session died.
+  if (allCandidates.length === 0 && !scopeResolution.partial) {
     throw new Error('No candidates extracted. Session may be expired.');
   }
 
@@ -729,7 +858,16 @@ export async function extractPipeline(
     orgs: Array.from(sweptOrgNames),
     open_jobs: openJobsByOrg,
     extraction_stats: {
-      orgs_total: orgsWithUserId.length,
+      // Scope facts first: a partial sweep must never be read as an audit of
+      // the whole account. orgs_total stays the account's identity count;
+      // fetched/failed are relative to the orgs actually requested.
+      scope: scopeResolution.partial ? 'partial' : 'full',
+      orgs_requested: orgsWithUserId.length,
+      requested_org_names: scopeResolution.partial ? orgsWithUserId.map((o) => o.name) : undefined,
+      unseen_orgs: scopeResolution.unseen.map((o) => o.name),
+      unmatched_scope_entries: scopeResolution.unmatched,
+      done_sweep: doneSweepMode,
+      orgs_total: identities.length,
       orgs_fetched: orgsFetched,
       orgs_failed: stillFailed.length,
       orgs_retried: failedOrgs.length,
