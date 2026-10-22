@@ -190,7 +190,82 @@ function mirrorSetCookies(session: AshbySession, setCookies: string[]): boolean 
  * Caller passes only resource-specific headers (content-type, etc.).
  * doFetch handles auth (cookie OR live context) + csrf + timeout.
  */
+// ── Per-request timing ────────────────────────────────────────────────────
+// Where does a sweep's wall-clock go? Accumulated per operation: the GraphQL
+// `op=` name, else the URL's last path segment (change_user, token,
+// available_identities, archive-status, …). extractPipeline snapshots this
+// before/after each org to log a per-org split and reports run totals in
+// extraction_stats.request_timing. ASHBY_TRACE_REQUESTS=1 also logs every
+// single request. The log file has no timestamps, so this is the only way to
+// tell a slow query from a slow org switch after the fact.
+export interface RequestTiming { calls: number; ms: number }
+const requestTimings = new Map<string, RequestTiming>();
+const TRACE_REQUESTS = ['1', 'true', 'yes'].includes((process.env.ASHBY_TRACE_REQUESTS || '').toLowerCase());
+
+function opNameFromUrl(url: string): string {
+  const m = /[?&]op=([^&]+)/.exec(url);
+  if (m) return decodeURIComponent(m[1]);
+  const path = url.replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+  const segments = path.split('/').filter(Boolean);
+  const last = segments[segments.length - 1] || path;
+  // change_user/<userId> → change_user
+  return /^[0-9a-f-]{20,}$/i.test(last) && segments.length > 1 ? segments[segments.length - 2] : last;
+}
+
+export function recordRequestTiming(op: string, ms: number): void {
+  const entry = requestTimings.get(op) || { calls: 0, ms: 0 };
+  entry.calls += 1;
+  entry.ms += ms;
+  requestTimings.set(op, entry);
+  if (TRACE_REQUESTS) console.log(`    ⏱ ${op} ${ms}ms`);
+}
+
+export function resetRequestTimings(): void {
+  requestTimings.clear();
+}
+
+export function snapshotRequestTimings(): Record<string, RequestTiming> {
+  const out: Record<string, RequestTiming> = {};
+  for (const [op, t] of requestTimings) out[op] = { ...t };
+  return out;
+}
+
+/** b − a per op, dropping ops with no new calls. */
+export function diffRequestTimings(
+  a: Record<string, RequestTiming>,
+  b: Record<string, RequestTiming>,
+): Record<string, RequestTiming> {
+  const out: Record<string, RequestTiming> = {};
+  for (const [op, t] of Object.entries(b)) {
+    const prev = a[op] || { calls: 0, ms: 0 };
+    const calls = t.calls - prev.calls;
+    if (calls > 0) out[op] = { calls, ms: t.ms - prev.ms };
+  }
+  return out;
+}
+
+/** "InitialFetch 9.8s, ArchivedSweep 3.1s (3), change_user 1.0s (2)" — slowest first. */
+export function formatRequestTimings(t: Record<string, RequestTiming>): string {
+  return Object.entries(t)
+    .sort((x, y) => y[1].ms - x[1].ms)
+    .map(([op, v]) => `${op} ${(v.ms / 1000).toFixed(1)}s${v.calls > 1 ? ` (${v.calls})` : ''}`)
+    .join(', ');
+}
+
 async function doFetch(
+  session: AshbySession,
+  url: string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string }
+): Promise<UnifiedResponse> {
+  const t0 = Date.now();
+  try {
+    return await doFetchRaw(session, url, init);
+  } finally {
+    recordRequestTiming(opNameFromUrl(url), Date.now() - t0);
+  }
+}
+
+async function doFetchRaw(
   session: AshbySession,
   url: string,
   init?: { method?: string; headers?: Record<string, string>; body?: string }

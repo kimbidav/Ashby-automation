@@ -7,7 +7,7 @@
  *   - Returns candidates in the same snake_case format the Lovable frontend expects
  */
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
-import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg, fetchCandidateRestrictedSummaries } from './client.js';
+import { fetchAllAvailableOrgs, fetchPipelineForOrg, fetchAvailableOrgs, enrichCandidatesWithDetails, fetchArchivedForOrg, fetchCandidateRestrictedSummaries, resetRequestTimings, snapshotRequestTimings, diffRequestTimings, formatRequestTimings } from './client.js';
 
 export interface ExtractedInterviewEvent {
   id: string;
@@ -397,6 +397,11 @@ export async function extractPipeline(
   const sweptOrgNames = new Set<string>();
   const failedOrgs: typeof orgsWithUserId = [];
   let authDead = false;
+  // Per-org wall-clock + per-operation request split for this run (see
+  // recordRequestTiming in client.ts). Reset here: write-lock.ts serializes
+  // every sweep in this process, so the counters belong to this run alone.
+  const orgSeconds: Record<string, number> = {};
+  resetRequestTimings();
 
   // Bounded done-sweep for one org — see sweepDoneRowsForOrg for the pair
   // semantics. Non-fatal: a done-sweep failure must never drop the org's
@@ -418,6 +423,8 @@ export async function extractPipeline(
       console.log(`  Progress: ${i}/${orgsWithUserId.length} orgs, ${allCandidates.length} candidates, ${elapsed}s`);
     }
     onProgress?.(i, orgsWithUserId.length, orgInfo.name);
+    const orgStartedAt = Date.now();
+    const timingsBefore = snapshotRequestTimings();
 
     try {
       const { companies, jobs, candidates } = await fetchPipelineForOrg(
@@ -433,6 +440,9 @@ export async function extractPipeline(
       if (orgInfo.name?.trim()) sweptOrgNames.add(orgInfo.name.trim());
       orgsFetched++;
       await sweepDoneForOrg(orgInfo, candidates);
+      const orgElapsedMs = Date.now() - orgStartedAt;
+      orgSeconds[orgInfo.name] = Math.round(orgElapsedMs / 100) / 10;
+      console.log(`  [${orgInfo.name}] ${(orgElapsedMs / 1000).toFixed(1)}s — ${formatRequestTimings(diffRequestTimings(timingsBefore, snapshotRequestTimings()))}`);
     } catch (err: any) {
       const msg = err?.message?.substring(0, 150) || '';
       console.error(`  [${orgInfo.name}] Failed: ${msg}`);
@@ -537,12 +547,14 @@ export async function extractPipeline(
         // response invalidates it, the rest 401, and Ashby revokes the whole
         // session chain. Sequential keeps exactly one token in flight.
         const enrichConcurrency = session.requestContext ? 5 : 1;
+        const enrichTimingsBefore = snapshotRequestTimings();
         allCandidates = await enrichCandidatesWithDetails(
           session,
           allCandidates,
           orgsWithUserId,
           { maxConcurrent: enrichConcurrency, shouldEnrich, deadlineMs: budgetForEnrich },
         );
+        console.log(`  Enrichment request split: ${formatRequestTimings(diffRequestTimings(enrichTimingsBefore, snapshotRequestTimings()))}`);
       } catch (err: any) {
         console.warn(`⚠️  Enrichment pass failed (non-fatal): ${err?.message?.substring(0, 150)}`);
       }
@@ -566,6 +578,7 @@ export async function extractPipeline(
   const totalElapsed = Math.round((Date.now() - startTime) / 1000);
   onProgress?.(orgsWithUserId.length, orgsWithUserId.length, 'Finalizing...');
   console.log(`Extraction complete in ${totalElapsed}s: ${allCandidates.length} candidates from ${orgsFetched}/${orgsWithUserId.length} orgs`);
+  console.log(`  Request split for the run: ${formatRequestTimings(snapshotRequestTimings())}`);
 
   if (allCandidates.length === 0) {
     throw new Error('No candidates extracted. Session may be expired.');
@@ -723,6 +736,10 @@ export async function extractPipeline(
       failed_org_names: stillFailed.map(o => o.name),
       total_seconds: totalElapsed,
       complete: stillFailed.length === 0,
+      // Phase 0 instrumentation (2026-10-22): seconds per org and the per-op
+      // request split, so a slow sweep is diagnosable from the result alone.
+      org_seconds: orgSeconds,
+      request_timing: snapshotRequestTimings(),
     },
   };
 }
