@@ -1429,6 +1429,7 @@ app.get('/api/session/status', async (_req: express.Request, res: express.Respon
 //     — sweep only these orgs (plus never-seen ones when include_unknown).
 //   done_sweep: 'full' (default) | 'live_only'
 //   enrich_credited_to: string[] — only enrich these recruiters' candidates.
+//   initial_fetch: 'full' | 'lean' — query shape; default lean for scoped runs.
 // A scoped result is marked extraction_stats.scope='partial' and is never
 // put in the result cache: the cache is read by callers that expect the
 // whole account.
@@ -1446,6 +1447,7 @@ function parseExtractOptions(body: any): ExtractOptions {
     };
   }
   if (body?.done_sweep === 'live_only') options.doneSweep = 'live_only';
+  if (body?.initial_fetch === 'lean' || body?.initial_fetch === 'full') options.initialFetch = body.initial_fetch;
   const enrich = strList(body?.enrich_credited_to);
   if (enrich?.length) options.enrichCreditedTo = enrich;
   return options;

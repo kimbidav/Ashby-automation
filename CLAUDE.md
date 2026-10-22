@@ -353,6 +353,7 @@ Both `POST /api/extract` and `POST /api/extract/start` accept, besides `force`:
 ```json
 { "scope": { "org_ids": ["…"], "org_names": ["Deeptune"], "known_org_ids": ["…"], "include_unknown": true },
   "done_sweep": "full",
+  "initial_fetch": "lean",
   "enrich_credited_to": ["david kimball", "david", "dk"] }
 ```
 
@@ -368,9 +369,23 @@ Both `POST /api/extract` and `POST /api/extract/start` accept, besides `force`:
   visible job while live on a no-access job (the Charles Lin case) looks
   exactly like one who left. The coordinator's quick sweep therefore keeps
   `done_sweep: "full"`.
+- `initial_fetch: "lean" | "full"` picks the `InitialFetch` shape; default
+  **lean for scoped runs**, full otherwise. Measured 2026-10-22
+  (`src/__probe_timing.ts`, run with the extractor stopped): the full query's
+  *first* execution after an org switch is the sweep's dominant cost — Agave
+  8.9s then 1.0s warm; 1190s of an 1824s run across 88 orgs — while the lean
+  query (the transient-error fallback's shape, no interview events or
+  scorecards) is 0.6–1.0s even cold. The three done-sweep views cost
+  Archived ~1–2s, Hired ~0.4s, ApplicationReview ~0.6s. A lean row carries
+  `interview_events: []`, `feedback_count: 0`, empty `latest_*`; the
+  coordinator's merge treats empty/zero as "no information" and unions
+  interview events, so rows that the targeted enrichment pass does not
+  re-fetch keep the detail from the last full sweep. In lean mode every
+  active row has zero events, so `enrich_credited_to` is what keeps the pass
+  to the recruiter in scope.
 - `extraction_stats` says what happened: `scope: "full" | "partial"`,
   `orgs_requested`, `requested_org_names` (partial only), `unseen_orgs`,
-  `unmatched_scope_entries`, `done_sweep`, plus the Phase-0 timing fields
+  `unmatched_scope_entries`, `done_sweep`, `initial_fetch`, plus the timing fields
   `org_seconds` and `request_timing`. `orgs_total` stays the account's identity
   count; `orgs_fetched` / `orgs_failed` / `failed_org_names` are relative to the
   requested set. **A partial result is never put in the 10-minute result

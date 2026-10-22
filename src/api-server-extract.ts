@@ -203,6 +203,15 @@ export interface ExtractOptions {
   /** Only enrich targets credited to these recruiters (default: everyone,
    *  priority order from ASHBY_RESTRICTED_PROBE_CREDITED_TO). */
   enrichCreditedTo?: string[];
+  /** Which InitialFetch shape the sweep uses. 'full' carries interview events
+   *  and scorecards inline; 'lean' omits them (the transient-error fallback's
+   *  query). Measured 2026-10-22: the full query's FIRST run after an org
+   *  switch is the sweep's dominant cost (2–15s per org, 1190s of an 1824s
+   *  run; warm it is ~1s) while lean is 0.6–1.0s even cold. Default: lean for
+   *  scoped runs (the targeted enrichment pass re-fetches the suspect rows of
+   *  the recruiters in scope, and the coordinator keeps existing enrichment
+   *  on rows that come back without it), full otherwise. */
+  initialFetch?: 'full' | 'lean';
 }
 
 export interface OrgIdentity { id: string; name: string; userId: string }
@@ -472,6 +481,7 @@ export async function extractPipeline(
   const scopeResolution = resolveSweepScope(identities, options.scope);
   const orgsWithUserId = scopeResolution.selected;
   const doneSweepMode: 'full' | 'live_only' = options.doneSweep === 'live_only' ? 'live_only' : 'full';
+  const leanInitialFetch = options.initialFetch ? options.initialFetch === 'lean' : scopeResolution.partial;
   const doneSweepViews: DoneSweepView[] | undefined = doneSweepMode === 'live_only' ? ['ApplicationReview'] : undefined;
   console.log(
     `Found ${orgInfos.length} org(s) (${identities.length} with userId). ` +
@@ -479,7 +489,7 @@ export async function extractPipeline(
       ? `Scoped sweep: ${orgsWithUserId.length} requested` +
         (scopeResolution.unseen.length ? ` + ${scopeResolution.unseen.length} never-seen org(s) (${scopeResolution.unseen.map((o) => o.name).join(', ')})` : '') +
         (scopeResolution.unmatched.length ? `; ${scopeResolution.unmatched.length} requested org(s) not on this account` : '') +
-        `; done-sweep ${doneSweepMode}. `
+        `; done-sweep ${doneSweepMode}; InitialFetch ${leanInitialFetch ? 'lean' : 'full'}. `
       : '') +
     `Will restore to ${firstOrg?.name || '?'} after extraction.`,
   );
@@ -546,7 +556,7 @@ export async function extractPipeline(
         orgInfo.id,
         orgInfo.userId,
         orgInfo.name,
-        { alreadyInOrg: true },
+        { alreadyInOrg: true, lean: leanInitialFetch },
       );
       allCompanies.push(...companies);
       allJobs.push(...jobs);
@@ -586,7 +596,8 @@ export async function extractPipeline(
           session,
           orgInfo.id,
           orgInfo.userId,
-          orgInfo.name
+          orgInfo.name,
+          { lean: leanInitialFetch },
         );
         allCompanies.push(...companies);
         allJobs.push(...jobs);
@@ -867,6 +878,7 @@ export async function extractPipeline(
       unseen_orgs: scopeResolution.unseen.map((o) => o.name),
       unmatched_scope_entries: scopeResolution.unmatched,
       done_sweep: doneSweepMode,
+      initial_fetch: leanInitialFetch ? 'lean' : 'full',
       orgs_total: identities.length,
       orgs_fetched: orgsFetched,
       orgs_failed: stillFailed.length,
