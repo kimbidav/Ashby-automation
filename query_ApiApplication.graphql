@@ -1565,13 +1565,6 @@ fragment ApplicationFormSubmissionWithFormRenderParts on ApplicationFormSubmissi
   __typename
 }
 
-fragment DisplayableJobParts on Job {
-  id
-  title
-  customRequisitionId
-  __typename
-}
-
 fragment OpeningVersionParts on OpeningVersion {
   id
   identifier
@@ -1587,10 +1580,6 @@ fragment OpeningVersionParts on OpeningVersion {
   }
   locations {
     ...DisplayableLocationAdminParts
-    __typename
-  }
-  jobs {
-    ...DisplayableJobParts
     __typename
   }
   customFields {
@@ -1617,10 +1606,6 @@ fragment OpeningParts on Opening {
   latestVersion {
     ...OpeningVersionParts
     canEdit
-    __typename
-  }
-  draftVersions {
-    ...OpeningVersionParts
     __typename
   }
   lockedApplications {

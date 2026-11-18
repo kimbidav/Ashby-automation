@@ -105,6 +105,11 @@ export interface Candidate {
   // feedback, and scheduling status are invisible — only the job title and
   // current stage are known.
   accessRestricted?: boolean;
+  // Which prebuilt view the bounded done-sweep pulled this row from. Rows from
+  // ApplicationReview are live pre-interview applications (zero interview
+  // events is their normal state), which the enrichment targeting needs to
+  // know; Archived/Hired rows are terminal.
+  sweptFrom?: 'Archived' | 'Hired' | 'ApplicationReview';
 
   // Enhanced fields
   primaryEmailAddress: string | null;

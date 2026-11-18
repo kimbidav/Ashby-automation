@@ -21,6 +21,7 @@
  * API calls are needed. Data is extracted during normalizePipelineData().
  */
 import fetch from 'cross-fetch';
+import https from 'node:https';
 import type { APIResponse } from 'playwright';
 import { AshbySession, Candidate, Company, InterviewEvent, Job } from './types.js';
 import { verifyJobMembership, logShapeOnce, verdictFromSwitchBody, WrongOrgContextError, IdentityVerdict } from './org-verify.js';
@@ -54,6 +55,14 @@ export function createAuthHeaders(session: AshbySession): Record<string, string>
 }
 
 const REQUEST_TIMEOUT_MS = 15_000; // 15s per API call — fail fast, don't hang
+
+// Cookie-mode transport reuses TLS connections. node-fetch 2 (behind
+// cross-fetch) on Node 18 opens a fresh connection per request without an
+// agent, and a full sweep makes ~1,000 requests — each paid DNS + TLS.
+// maxSockets 2: Ashby's session token rotates per response, so requests are
+// serialized anyway (see enrichCandidatesWithDetails); 2 leaves headroom
+// for the cookie persistence hook without fanning out.
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 2 });
 
 // Per-call override for the few queries known to outrun 15s. Safe as a module
 // variable because write-lock.ts serializes all session use in this process.
@@ -190,7 +199,82 @@ function mirrorSetCookies(session: AshbySession, setCookies: string[]): boolean 
  * Caller passes only resource-specific headers (content-type, etc.).
  * doFetch handles auth (cookie OR live context) + csrf + timeout.
  */
+// ── Per-request timing ────────────────────────────────────────────────────
+// Where does a sweep's wall-clock go? Accumulated per operation: the GraphQL
+// `op=` name, else the URL's last path segment (change_user, token,
+// available_identities, archive-status, …). extractPipeline snapshots this
+// before/after each org to log a per-org split and reports run totals in
+// extraction_stats.request_timing. ASHBY_TRACE_REQUESTS=1 also logs every
+// single request. The log file has no timestamps, so this is the only way to
+// tell a slow query from a slow org switch after the fact.
+export interface RequestTiming { calls: number; ms: number }
+const requestTimings = new Map<string, RequestTiming>();
+const TRACE_REQUESTS = ['1', 'true', 'yes'].includes((process.env.ASHBY_TRACE_REQUESTS || '').toLowerCase());
+
+export function opNameFromUrl(url: string): string {
+  const m = /[?&]op=([^&]+)/.exec(url);
+  if (m) return decodeURIComponent(m[1]);
+  const path = url.replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+  const segments = path.split('/').filter(Boolean);
+  const last = segments[segments.length - 1] || path;
+  // change_user/<userId> → change_user
+  return /^[0-9a-f-]{20,}$/i.test(last) && segments.length > 1 ? segments[segments.length - 2] : last;
+}
+
+export function recordRequestTiming(op: string, ms: number): void {
+  const entry = requestTimings.get(op) || { calls: 0, ms: 0 };
+  entry.calls += 1;
+  entry.ms += ms;
+  requestTimings.set(op, entry);
+  if (TRACE_REQUESTS) console.log(`    ⏱ ${op} ${ms}ms`);
+}
+
+export function resetRequestTimings(): void {
+  requestTimings.clear();
+}
+
+export function snapshotRequestTimings(): Record<string, RequestTiming> {
+  const out: Record<string, RequestTiming> = {};
+  for (const [op, t] of requestTimings) out[op] = { ...t };
+  return out;
+}
+
+/** b − a per op, dropping ops with no new calls. */
+export function diffRequestTimings(
+  a: Record<string, RequestTiming>,
+  b: Record<string, RequestTiming>,
+): Record<string, RequestTiming> {
+  const out: Record<string, RequestTiming> = {};
+  for (const [op, t] of Object.entries(b)) {
+    const prev = a[op] || { calls: 0, ms: 0 };
+    const calls = t.calls - prev.calls;
+    if (calls > 0) out[op] = { calls, ms: t.ms - prev.ms };
+  }
+  return out;
+}
+
+/** "InitialFetch 9.8s, ArchivedSweep 3.1s (3), change_user 1.0s (2)" — slowest first. */
+export function formatRequestTimings(t: Record<string, RequestTiming>): string {
+  return Object.entries(t)
+    .sort((x, y) => y[1].ms - x[1].ms)
+    .map(([op, v]) => `${op} ${(v.ms / 1000).toFixed(1)}s${v.calls > 1 ? ` (${v.calls})` : ''}`)
+    .join(', ');
+}
+
 async function doFetch(
+  session: AshbySession,
+  url: string,
+  init?: { method?: string; headers?: Record<string, string>; body?: string }
+): Promise<UnifiedResponse> {
+  const t0 = Date.now();
+  try {
+    return await doFetchRaw(session, url, init);
+  } finally {
+    recordRequestTiming(opNameFromUrl(url), Date.now() - t0);
+  }
+}
+
+async function doFetchRaw(
   session: AshbySession,
   url: string,
   init?: { method?: string; headers?: Record<string, string>; body?: string }
@@ -222,7 +306,8 @@ async function doFetch(
     headers,
     body: init?.body,
     signal: withTimeout(requestTimeoutOverride ?? REQUEST_TIMEOUT_MS),
-  });
+    agent: keepAliveAgent, // node-fetch option; cross-fetch's RequestInit type omits it
+  } as any);
 
   // Ashby rotates session cookies on arbitrary responses, not just org
   // switches — mirror every rotation so the next request stays authenticated,
@@ -684,7 +769,7 @@ export async function fetchAvailableOrgs(session: AshbySession): Promise<OrgInfo
   return [];
 }
 
-async function switchOrgContext(session: AshbySession, userId: string, orgId?: string): Promise<IdentityVerdict> {
+export async function switchOrgContext(session: AshbySession, userId: string, orgId?: string): Promise<IdentityVerdict> {
   const url = `https://app.ashbyhq.com/api/auth/change_user/${userId}`;
 
   const res = await doFetch(session, url, {
@@ -791,6 +876,11 @@ export async function fetchAllAvailableOrgs(session: AshbySession): Promise<OrgI
   return Array.from(orgMap.values());
 }
 
+/** Thrown internally to route a `lean` request down the existing fallback path. */
+class LeanInitialFetchRequested extends Error {
+  constructor() { super('lean InitialFetch requested'); }
+}
+
 export async function fetchPipelineForOrg(
   session: AshbySession,
   orgId: string,
@@ -800,13 +890,22 @@ export async function fetchPipelineForOrg(
   // is where the sweep used to read the org name mid-query; the caller already
   // has it, so we thread it in instead. See the sessionUserV2 removal below.
   orgNameHint?: string,
+  options: {
+    alreadyInOrg?: boolean;
+    /** Use the lean InitialFetch (no interviewEvents/scorecards) from the
+     *  start — the same query the transient-error fallback already uses, so
+     *  no new shape. For scoped sweeps whose caller keeps existing enrichment
+     *  per row and re-fetches the suspect ones. */
+    lean?: boolean;
+  } = {},
 ): Promise<PipelineFetchResult> {
-  // If we have a userId, switch to that org context first
-  let switchedOrg = false;
-  if (userId && orgId !== 'default') {
+  // Switch to the org context first — unless the caller (the sweep loop)
+  // already did. The sweep used to pay this change_user + CSRF round-trip
+  // twice per org (here and again in fetchArchivedForOrg); on 2026-10-22
+  // that was 5 of ~12 calls per org across 88 orgs.
+  if (userId && orgId !== 'default' && !options.alreadyInOrg) {
     try {
       await switchOrgContext(session, userId);
-      switchedOrg = true;
     } catch (error) {
       // Re-throw so the sweep loop counts this org as FAILED, not as
       // "swept with zero candidates". Swallowing the error here made a
@@ -986,7 +1085,6 @@ export async function fetchPipelineForOrg(
         customRequisitionId
         confidential
         userFollowsOrHasRole
-        applicationCount
         __typename
       }
       result: applicationsByPrebuiltView(
@@ -1147,13 +1245,35 @@ ${applicationFieldsFragment}
   };
 
   try {
-    const initialData = await graphqlQuery<InitialFetchResponse>(
-      session,
-      'InitialFetch',
-      initialQuery,
-      initialVars,
-      switchedOrg
-    );
+    if (options.lean) throw new LeanInitialFetchRequested();
+    // Same slow first-query-after-org-switch as fetchOpenJobs: for big orgs
+    // (Valon Tech, Owner.com, EliseAI, Prelim, Nooks, January, LangChain) it
+    // outran 15s on every sweep from ~2026-08-20, the org was dropped from the
+    // trusted set, and the backend's org-health banner reported it as "no
+    // longer readable" while DK still had access. `applicationCount` (the
+    // known ~90s field) is no longer requested; 45s + two retries covers the rest.
+    let initialData: InitialFetchResponse | undefined;
+    requestTimeoutOverride = 45_000;
+    try {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          initialData = await graphqlQuery<InitialFetchResponse>(
+            session,
+            'InitialFetch',
+            initialQuery,
+            initialVars,
+            attempt > 1 // the org switch (ours or the caller's) already refreshed CSRF
+          );
+          break;
+        } catch (err: any) {
+          if (!isTimeoutError(err) || attempt >= 3) throw err;
+          console.warn(`  InitialFetch timed out for org ${orgName || orgId}, retrying (${attempt}/2)...`);
+        }
+      }
+    } finally {
+      requestTimeoutOverride = null;
+    }
+    if (!initialData) throw new Error('InitialFetch returned no data');
 
     jobsData = { jobsPipelines: initialData.jobsPipelines };
     console.log(`Found ${jobsData.jobsPipelines.length} open jobs`);
@@ -1165,10 +1285,14 @@ ${applicationFieldsFragment}
   } catch (error: any) {
     // If the full query fails (even after retries in graphqlQuery), try a fallback
     // with stripped-down fields (no scorecard data which can cause server errors)
-    const isServerError = error?.message?.includes('Unidentified server error') ||
+    const leanRequested = error instanceof LeanInitialFetchRequested;
+    const isServerError = leanRequested ||
+                          error?.message?.includes('Unidentified server error') ||
                           error?.message?.includes('looking into it');
     if (isServerError) {
-      console.warn(`  ⚠️  Full query failed for org ${orgId}, retrying with simplified query (no scorecard data)...`);
+      if (!leanRequested) {
+        console.warn(`  ⚠️  Full query failed for org ${orgId}, retrying with simplified query (no scorecard data)...`);
+      }
       useFallbackQuery = true;
 
       const fallbackInitialQuery = `
@@ -1193,7 +1317,6 @@ ${applicationFieldsFragment}
             customRequisitionId
             confidential
             userFollowsOrHasRole
-            applicationCount
             __typename
           }
           result: applicationsByPrebuiltView(
@@ -1218,13 +1341,32 @@ ${applicationFieldsFragment}
       `;
 
       try {
-        const fallbackData = await graphqlQuery<InitialFetchResponse>(
-          session,
-          'InitialFetch',
-          fallbackInitialQuery,
-          initialVars,
-          true // force CSRF refresh
-        );
+        // Same 45s + two retries as the full query: the lean shape is
+        // cheaper but a cold org can still outrun 15s (EliseAI aborted on
+        // the first scoped sweep, 2026-10-22), and an abort here used to fail
+        // the org outright.
+        let fallbackData: InitialFetchResponse | undefined;
+        requestTimeoutOverride = 45_000;
+        try {
+          for (let attempt = 1; ; attempt++) {
+            try {
+              fallbackData = await graphqlQuery<InitialFetchResponse>(
+                session,
+                'InitialFetch',
+                fallbackInitialQuery,
+                initialVars,
+                (!leanRequested && attempt === 1) || attempt > 1 // error path: force a CSRF refresh; lean-by-request: the switch just did
+              );
+              break;
+            } catch (err: any) {
+              if (!isTimeoutError(err) || attempt >= 3) throw err;
+              console.warn(`  InitialFetch (lean) timed out for org ${orgName || orgId}, retrying (${attempt}/2)...`);
+            }
+          }
+        } finally {
+          requestTimeoutOverride = null;
+        }
+        if (!fallbackData) throw new Error('InitialFetch (lean) returned no data');
 
         jobsData = { jobsPipelines: fallbackData.jobsPipelines };
         console.log(`  Found ${jobsData.jobsPipelines.length} open jobs (fallback)`);
@@ -1531,19 +1673,33 @@ function normalizePipelineData(
  * budget. The valid enum (confirmed empirically) is `ApplicationPrebuiltViewType`
  * with values Active / Archived / Hired.
  */
+export type DoneSweepView = 'Archived' | 'Hired' | 'ApplicationReview';
+export const ALL_DONE_SWEEP_VIEWS: DoneSweepView[] = ['Archived', 'Hired', 'ApplicationReview'];
+
 export async function fetchArchivedForOrg(
   session: AshbySession,
   orgId: string,
   userId: string | undefined,
   orgName: string | undefined,
-  options: { sinceDays?: number; maxPages?: number; pageSize?: number } = {},
+  options: {
+    sinceDays?: number;
+    maxPages?: number;
+    pageSize?: number;
+    /** The sweep loop already switched into this org — skip change_user + CSRF. */
+    alreadyInOrg?: boolean;
+    /** Which prebuilt views to read; default all three. ApplicationReview holds
+     *  LIVE pre-interview rows (the Active view never returns them), so a
+     *  "live only" sweep still needs it. */
+    views?: DoneSweepView[];
+  } = {},
 ): Promise<Candidate[]> {
   const sinceDays = options.sinceDays ?? 60;
   const maxPages = options.maxPages ?? 3;
   const pageSize = options.pageSize ?? 50;
+  const views = options.views ?? ALL_DONE_SWEEP_VIEWS;
   const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
 
-  if (userId && orgId !== 'default') {
+  if (userId && orgId !== 'default' && !options.alreadyInOrg) {
     try {
       await switchOrgContext(session, userId);
     } catch (error) {
@@ -1570,7 +1726,7 @@ export async function fetchArchivedForOrg(
         __typename`;
 
   const out: Candidate[] = [];
-  for (const view of ['Archived', 'Hired', 'ApplicationReview'] as const) {
+  for (const view of views) {
     const query = `
       query ArchivedSweep($cursor: String, $limit: Int, $orderByFields: [OrderByFieldInput]) {
         result: applicationsByPrebuiltView(
@@ -1591,7 +1747,7 @@ export async function fetchArchivedForOrg(
           cursor,
           limit: pageSize,
           orderByFields: [{ field: 'submitted_at', ascending: false }],
-        }, page === 0);
+        }, false); // CSRF was refreshed by the org switch; a 403 still self-heals in graphqlQuery
       } catch (error: any) {
         console.warn(`  archived-sweep (${view}, org ${orgId}): ${error?.message?.substring(0, 120)}`);
         break;
@@ -1638,6 +1794,7 @@ export async function fetchArchivedForOrg(
           companyId: `company-${app?.candidate?.company || orgName || orgId}`,
           orgId,
           orgName,
+          sweptFrom: view,
           lastActivityAt,
           daysInStage: lastActivityAt ? computeDaysInStage(lastActivityAt) : 0,
           needsScheduling: false,
@@ -1966,6 +2123,20 @@ function getCurrentStageEnteredAt(details: {
   return candidates[0]?.enteredStageAt || null;
 }
 
+// The ~29 KB ApiApplication query, read once per process. It used to be read
+// from disk on every call — several hundred times per enrichment pass.
+let apiApplicationQueryPromise: Promise<string> | null = null;
+async function loadApiApplicationQuery(): Promise<string> {
+  if (!apiApplicationQueryPromise) {
+    apiApplicationQueryPromise = (async () => {
+      const fs = await import('node:fs/promises');
+      const path = await import('node:path');
+      return fs.readFile(path.join(process.cwd(), 'query_ApiApplication.graphql'), 'utf8');
+    })();
+  }
+  return apiApplicationQueryPromise;
+}
+
 /**
  * Fetch detailed application data including interview feedback and ratings
  */
@@ -1983,11 +2154,7 @@ export async function fetchApplicationDetails(
   archiveReason: any;
 } | null> {
   try {
-    // Load the ApiApplication query from file
-    const fs = await import('node:fs/promises');
-    const path = await import('node:path');
-    const queryPath = path.join(process.cwd(), 'query_ApiApplication.graphql');
-    const query = await fs.readFile(queryPath, 'utf8');
+    const query = await loadApiApplicationQuery();
 
     interface ApplicationDetailResponse {
       application: {
@@ -2176,6 +2343,13 @@ export async function enrichCandidatesWithDetails(
     fetchAll?: boolean;
     shouldEnrich?: (c: Candidate) => boolean;
     deadlineMs?: number;
+    /** Credited-to names (case-insensitive) whose targets go FIRST — orgs with
+     *  any of them before orgs without, and within an org before the rest —
+     *  so the deadline cuts the least important work. */
+    priorityCreditedTo?: string[];
+    /** When set, only targets credited to one of these names are enriched
+     *  at all (quick, recruiter-scoped sweeps). '*' means everyone. */
+    restrictCreditedTo?: string[];
   } = {}
 ): Promise<Candidate[]> {
   const {
@@ -2183,7 +2357,19 @@ export async function enrichCandidatesWithDetails(
     fetchAll = false,
     shouldEnrich,
     deadlineMs,
+    priorityCreditedTo,
+    restrictCreditedTo,
   } = options;
+  const normNames = (xs?: string[]): string[] => (xs || []).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const creditedMatches = (c: Candidate, aliases: string[]): boolean => {
+    if (aliases.length === 0) return false;
+    if (aliases.includes('*')) return true;
+    const name = (c.creditedTo || '').trim().toLowerCase();
+    return !!name && aliases.includes(name);
+  };
+  const priorityAliases = normNames(priorityCreditedTo);
+  const restrictAliases = normNames(restrictCreditedTo);
+  const isPriority = (c: Candidate) => creditedMatches(c, priorityAliases);
 
   const startedAt = Date.now();
   const deadlineAt = deadlineMs ? startedAt + deadlineMs : Number.POSITIVE_INFINITY;
@@ -2199,7 +2385,9 @@ export async function enrichCandidatesWithDetails(
     return !!c.needsScheduling;
   };
 
-  const enrichTargets = candidates.filter(wantEnrich);
+  const enrichTargets = candidates
+    .filter(wantEnrich)
+    .filter((c) => restrictAliases.length === 0 || creditedMatches(c, restrictAliases));
   console.log(
     `\nEnriching ${enrichTargets.length}/${candidates.length} candidates with interview details` +
       (deadlineMs ? ` (deadline ${Math.round(deadlineMs / 1000)}s)` : '') +
@@ -2220,7 +2408,21 @@ export async function enrichCandidatesWithDetails(
     candidatesByOrg.get(candidate.orgId)!.push(candidate);
   }
 
-  console.log(`  Grouped into ${candidatesByOrg.size} organizations\n`);
+  // Order orgs so the deadline cuts the least important work last: orgs with
+  // priority-credited targets first (most first), then by newest activity.
+  // Within an org the priority targets go first for the same reason. Until
+  // 2026-10-22 this ran in discovery (alphabetical) order and the 180s floor
+  // always cut off around the same letter, so late-alphabet orgs were never
+  // enriched and early ones were redone every run.
+  const newestActivity = (list: Candidate[]) => list.reduce((m, c) => ((c.lastActivityAt || '') > m ? c.lastActivityAt || '' : m), '');
+  const orgOrder = Array.from(candidatesByOrg.entries())
+    .map(([orgId, list]) => {
+      list.sort((a, b) => Number(isPriority(b)) - Number(isPriority(a)) || (b.lastActivityAt || '').localeCompare(a.lastActivityAt || ''));
+      return { orgId, list, priorityCount: list.filter(isPriority).length, newest: newestActivity(list) };
+    })
+    .sort((a, b) => b.priorityCount - a.priorityCount || b.newest.localeCompare(a.newest));
+  const orgsWithPriority = orgOrder.filter((o) => o.priorityCount > 0).length;
+  console.log(`  Grouped into ${candidatesByOrg.size} organizations (${orgsWithPriority} with priority-credited targets, enriched first)\n`);
 
   // Process candidates org by org to minimize context switching
   // Keyed by applicationId so the final merge preserves order and lets us
@@ -2230,7 +2432,7 @@ export async function enrichCandidatesWithDetails(
   let processed = 0;
   let aborted = false;
 
-  for (const [orgId, orgCandidates] of candidatesByOrg.entries()) {
+  for (const { orgId, list: orgCandidates } of orgOrder) {
     if (overBudget()) {
       aborted = true;
       console.warn(`  ⏱  Deadline reached; skipping remaining orgs`);

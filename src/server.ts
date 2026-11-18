@@ -26,7 +26,7 @@ import crypto from 'crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, BrowserContext } from 'playwright';
-import { createSessionFromCookie, extractPipeline, ExtractResult, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
+import { createSessionFromCookie, extractPipeline, ExtractResult, ExtractOptions, getOrgCacheStats, clearOrgCache } from './api-server-extract.js';
 import { fetchArchiveStatuses, fetchCsrfToken, fetchAllAvailableOrgs, fetchAllAvailableOrgsWithEmail, enterOrgContext, verifyCurrentOrgHasJob, fetchOpenJobsForOrg, fetchCandidateRestrictedSummaries } from './client.js';
 import { isWrongOrgContextError, wrongOrgResponseBody, isSessionAuthFailure, redactSecrets } from './org-verify.js';
 import {
@@ -127,6 +127,8 @@ interface SweepCallback {
 interface ExtractionJob {
   id: string;
   status: 'running' | 'completed' | 'failed';
+  /** 'partial' when the request carried a scope (see parseExtractOptions). */
+  scope?: 'full' | 'partial';
   created_at: string;
   completed_at?: string;
   progress?: { completed: number; total: number; current_org: string };
@@ -542,15 +544,45 @@ async function clearStaleSingletonLocks(profileDir: string): Promise<void> {
 
 app.post('/api/auth/start', async (_req: express.Request, res: express.Response) => {
   if (liveContext) {
-    // Already up. Return current status instead of double-launching.
-    const probe = await probeLiveAuth(liveContext);
-    res.json({
-      already_running: true,
-      authenticated: probe.ok,
-      reason: probe.reason,
-      started_at: liveContextStartedAt,
-    });
-    return;
+    // Already up. Return current status instead of double-launching —
+    // unless the user closed the window. Cmd-W on the last tab leaves the
+    // Chromium process (and this context) alive with ZERO pages, so 'close'
+    // never fires and "already running" means "nothing on screen". Seen
+    // 2026-10-13: the dashboard sat at "Waiting for Chromium login…" for two
+    // hours with no window to sign into, every fetch fell back to the older
+    // persisted login, and a client added that day (Longitude Labs) stayed
+    // `unknown_org`. Reopen the sign-in page in the same context; if the
+    // context turns out to be dead, drop it and launch fresh below.
+    let reopened = false;
+    if (liveContext.pages().length === 0) {
+      const ctx = liveContext;
+      try {
+        const page = await ctx.newPage();
+        await page.goto('https://app.ashbyhq.com/signin', { waitUntil: 'domcontentloaded' }).catch((err) => {
+          console.warn('[live-auth] reopen navigation warning:', err?.message);
+        });
+        reopened = true;
+        console.log('[live-auth] login window had been closed; reopened the sign-in page.');
+      } catch (err: any) {
+        console.warn(`[live-auth] could not reopen a page in the live context (${err?.message}); relaunching.`);
+        liveContext = null;
+        liveContextStartedAt = null;
+        await ctx.close().catch(() => {});
+      }
+    }
+    const ctx = liveContext;
+    if (ctx) {
+      const probe = await probeLiveAuth(ctx);
+      res.json({
+        already_running: true,
+        reopened,
+        window_open: ctx.pages().length > 0,
+        authenticated: probe.ok,
+        reason: probe.reason,
+        started_at: liveContextStartedAt,
+      });
+      return;
+    }
   }
 
   try {
@@ -664,6 +696,8 @@ app.get('/api/auth/status', async (_req: express.Request, res: express.Response)
   const probe = await probeLiveAuth(liveContext);
   res.json({
     live_active: true,
+    // false = the user closed the window; POST /api/auth/start reopens it.
+    window_open: liveContext.pages().length > 0,
     authenticated: probe.ok,
     reason: probe.reason,
     started_at: liveContextStartedAt,
@@ -1403,6 +1437,40 @@ app.get('/api/session/status', async (_req: express.Request, res: express.Respon
   }
 });
 
+// ── Extract request options ──────────────────────────────────────────────
+// Body fields shared by /api/extract and /api/extract/start:
+//   scope: { org_ids?, org_names?, known_org_ids?, include_unknown? }
+//     — sweep only these orgs (plus never-seen ones when include_unknown).
+//   done_sweep: 'full' (default) | 'live_only'
+//   enrich_credited_to: string[] — only enrich these recruiters' candidates.
+//   initial_fetch: 'full' | 'lean' — query shape; default lean for scoped runs.
+// A scoped result is marked extraction_stats.scope='partial' and is never
+// put in the result cache: the cache is read by callers that expect the
+// whole account.
+function parseExtractOptions(body: any): ExtractOptions {
+  const strList = (v: unknown): string[] | undefined =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim()) : undefined;
+  const options: ExtractOptions = {};
+  const scope = body?.scope;
+  if (scope && typeof scope === 'object') {
+    options.scope = {
+      org_ids: strList(scope.org_ids),
+      org_names: strList(scope.org_names),
+      known_org_ids: strList(scope.known_org_ids),
+      include_unknown: scope.include_unknown === true,
+    };
+  }
+  if (body?.done_sweep === 'live_only') options.doneSweep = 'live_only';
+  if (body?.initial_fetch === 'lean' || body?.initial_fetch === 'full') options.initialFetch = body.initial_fetch;
+  const enrich = strList(body?.enrich_credited_to);
+  if (enrich?.length) options.enrichCreditedTo = enrich;
+  return options;
+}
+
+function isPartialResult(result: { extraction_stats?: Record<string, unknown> }): boolean {
+  return result.extraction_stats?.scope === 'partial';
+}
+
 // ── Synchronous extraction ───────────────────────────────────────────────
 
 app.post('/api/extract', async (req: express.Request, res: express.Response) => {
@@ -1422,9 +1490,10 @@ app.post('/api/extract', async (req: express.Request, res: express.Response) => 
   }
 
   try {
-    const data = await withGlobalLock('extract', () => extractPipeline(validation.session));
+    const options = parseExtractOptions(req.body);
+    const data = await withGlobalLock('extract', () => extractPipeline(validation.session, undefined, options));
     const result = formatResult(data);
-    setCachedResult(result);
+    if (!isPartialResult(result)) setCachedResult(result);
     res.json(result);
   } catch (err: any) {
     handleExtractionError(err, res);
@@ -1465,7 +1534,7 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
     if (running && running.status === 'running') {
       console.log(`Attaching caller to in-flight extraction job ${running.id}`);
       addSweepCallback(running, req.body);
-      res.json({ jobId: running.id, job_id: running.id, id: running.id, status: 'running', attached: true });
+      res.json({ jobId: running.id, job_id: running.id, id: running.id, status: 'running', attached: true, scope: running.scope ?? 'full' });
       return;
     }
     runningJobId = null;
@@ -1479,10 +1548,12 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
 
   cleanupOldJobs();
 
+  const options = parseExtractOptions(req.body);
   const jobId = crypto.randomUUID();
   const job: ExtractionJob = {
     id: jobId,
     status: 'running',
+    scope: options.scope ? 'partial' : 'full',
     created_at: new Date().toISOString(),
     progress: { completed: 0, total: 0, current_org: 'Starting...' },
   };
@@ -1495,11 +1566,11 @@ app.post('/api/extract/start', async (req: express.Request, res: express.Respons
   withGlobalLock('extract-async', () =>
     extractPipeline(validation.session, (completed, total, currentOrg) => {
       job.progress = { completed, total, current_org: currentOrg };
-    }),
+    }, options),
   )
     .then((data) => {
       const result = formatResult(data);
-      setCachedResult(result);
+      if (!isPartialResult(result)) setCachedResult(result);
       job.status = 'completed';
       job.completed_at = new Date().toISOString();
       job.result = result;
@@ -1541,6 +1612,7 @@ const handleJobStatus = (req: express.Request, res: express.Response) => {
       jobId: job.id,
       job_id: job.id,
       status: 'running',
+      scope: job.scope ?? 'full',
       created_at: job.created_at,
       progress: job.progress,
     });
